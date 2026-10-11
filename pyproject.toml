@@ -1,0 +1,54 @@
+[project]
+name = "sqlalchemy-openobserve"
+version = "0.0.1"
+description = "SQLAlchemy dialect and DBAPI driver for OpenObserve"
+authors = [
+    {name = "Milen Thomas"},
+]
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
+dependencies = [
+    "sqlalchemy>=2.0.52,<2.1",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4.2,<9.0.0",
+    "ruff>=0.16.8,<0.17.0",
+    "mypy>=1.18.2,<2.0.0",
+]
+
+[project.urls]
+Repository = "https://github.com/sqlalchemy-openobserve/sqlalchemy-openobserve"
+
+[project.entry-points."sqlalchemy.dialects"]
+openobserve = "sqlalchemy_openobserve.dialect:OpenObserveDialect"
+"openobserve.rest" = "sqlalchemy_openobserve.dialect:OpenObserveDialect"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 79
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
