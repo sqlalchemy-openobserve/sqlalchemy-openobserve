@@ -20,7 +20,10 @@ class OpenObserveClient:
         self.email = email
         self.password = password
 
-    def search(self, sql: str) -> dict[str, Any]:
+    def search(
+        self, sql: str, start_time: int, end_time: int
+    ) -> dict[str, Any]:
+        """Run a query. Times are microseconds since the epoch."""
         raise NotImplementedError
 
     def list_streams(self) -> list[str]:
