@@ -1,0 +1,10 @@
+services:
+  openobserve:
+    image: public.ecr.aws/zinclabs/openobserve:v1.0.4
+    ports:
+      - "127.0.0.1:5080:5080"
+    environment:
+      ZO_ROOT_USER_EMAIL: root@example.com
+      ZO_ROOT_USER_PASSWORD: Complexpass#123
+      # Hours. The default of 5 rejects the older sample rows.
+      ZO_INGEST_ALLOWED_UPTO: "72"
