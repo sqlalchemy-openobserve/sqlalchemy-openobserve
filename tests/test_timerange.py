@@ -83,10 +83,13 @@ def test_iso_string_forms() -> None:
 
 
 def test_strict_and_inclusive_operators() -> None:
-    sql = "SELECT * FROM t WHERE ts > '2024-01-01' AND ts <= '2024-02-01'"
+    sql = (
+        "SELECT * FROM t WHERE ts > '2024-01-01 00:00:00' "
+        "AND ts <= '2024-02-01 12:00:00'"
+    )
     low, high = extract_time_range(sql)
     assert low == us(2024, 1, 1) + 1
-    assert high == us(2024, 2, 1) + 1
+    assert high == us(2024, 2, 1, 12) + 1
 
 
 def test_mirrored_operators() -> None:
@@ -104,7 +107,10 @@ def test_equality_window() -> None:
 
 
 def test_between_is_inclusive() -> None:
-    sql = "SELECT * FROM t WHERE ts BETWEEN '2024-01-01' AND '2024-02-01'"
+    sql = (
+        "SELECT * FROM t WHERE ts BETWEEN '2024-01-01 00:00:00' "
+        "AND '2024-02-01 00:00:00'"
+    )
     low, high = extract_time_range(sql)
     assert (low, high) == (us(2024, 1, 1), us(2024, 2, 1) + 1)
 
@@ -154,7 +160,7 @@ def test_and_takes_tightest() -> None:
         "AND ts >= '2024-02-01' AND ts <= '2024-03-01'"
     )
     low, high = extract_time_range(sql)
-    assert (low, high) == (us(2024, 2, 1), us(2024, 3, 1) + 1)
+    assert (low, high) == (us(2024, 2, 1), us(2024, 3, 2))
 
 
 def test_contradictory_bounds_stay_ordered() -> None:
@@ -265,7 +271,10 @@ def test_epoch_outside_plausible_window_is_wide() -> None:
 
 
 def test_in_list() -> None:
-    sql = "SELECT * FROM t WHERE ts IN ('2024-01-01', '2024-01-03')"
+    sql = (
+        "SELECT * FROM t WHERE ts IN "
+        "('2024-01-01 00:00:00', '2024-01-03 00:00:00')"
+    )
     low, high = extract_time_range(sql)
     assert (low, high) == (us(2024, 1, 1), us(2024, 1, 3) + 1)
 
@@ -461,3 +470,66 @@ def test_superset_epoch_wrapped_filter_column() -> None:
     )
     low, _ = extract_time_range(sql)
     assert low == us(2024, 1, 1)
+
+
+# A day-granular literal, like '2024-01-01', covers its whole day on
+# the inclusive upper side: the range ends at the next midnight.
+
+
+def test_date_only_equality_covers_whole_day() -> None:
+    sql = "SELECT * FROM t WHERE day = '2024-01-01'"
+    assert extract_time_range(sql) == (us(2024, 1, 1), us(2024, 1, 2))
+
+
+def test_date_only_upper_bound_ends_at_next_midnight() -> None:
+    sql = "SELECT * FROM t WHERE day <= '2024-01-01'"
+    low, high = extract_time_range(sql)
+    assert low == 1
+    assert high == us(2024, 1, 2)
+
+
+def test_date_only_between_covers_final_day() -> None:
+    sql = "SELECT * FROM t WHERE day BETWEEN '2024-01-01' AND '2024-01-02'"
+    assert extract_time_range(sql) == (us(2024, 1, 1), us(2024, 1, 3))
+
+
+def test_date_only_in_covers_final_day() -> None:
+    sql = "SELECT * FROM t WHERE day IN ('2024-01-01', '2024-01-02')"
+    assert extract_time_range(sql) == (us(2024, 1, 1), us(2024, 1, 3))
+
+
+# A date-shaped string compared to an ordinary column is just a string
+# comparison: it must not narrow the range.
+
+
+def test_non_time_column_does_not_constrain_range() -> None:
+    sql = (
+        "SELECT * FROM t WHERE region > '2024-01-01' "
+        "AND _timestamp >= '2024-06-01'"
+    )
+    low, _ = extract_time_range(sql)
+    assert low == us(2024, 6, 1)
+
+
+def test_non_time_column_stricter_than_time_filter_is_ignored() -> None:
+    # The region bound is the tighter one; it still must not win
+    sql = (
+        "SELECT * FROM t WHERE region > '2025-06-01' "
+        "AND _timestamp >= '2024-06-01'"
+    )
+    low, _ = extract_time_range(sql)
+    assert low == us(2024, 6, 1)
+
+
+def test_time_function_of_ordinary_column_still_bounds() -> None:
+    # The function marks the expression as time, even when the column
+    # inside it has an ordinary name
+    sql = "SELECT * FROM t WHERE from_unixtime(start) >= '2024-01-01'"
+    low, _ = extract_time_range(sql)
+    assert low == us(2024, 1, 1)
+
+
+def test_unknown_function_of_ordinary_column_is_wide() -> None:
+    sql = "SELECT * FROM t WHERE lower(region) >= '2024-01-01'"
+    low, _ = extract_time_range(sql)
+    assert low == 1
