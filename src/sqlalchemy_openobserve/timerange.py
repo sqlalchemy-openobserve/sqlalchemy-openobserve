@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 _MARGIN_US = 3_600_000_000
+_DAY_US = 86_400_000_000
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -76,6 +77,21 @@ _FLIP = {
 
 _NOW_NAMES = ("NOW", "CURRENT_TIMESTAMP")
 
+# Functions that only ever make sense on a time-like expression
+_TIME_FUNCTIONS = frozenset(
+    {
+        "date_bin",
+        "date_format",
+        "date_trunc",
+        "from_unixtime",
+        "histogram",
+        "strftime",
+    }
+)
+
+# A day-granular literal, like '2024-01-01', covers its whole day
+_DATE_ONLY = re.compile(r"\d{4}-\d{2}-\d{2}|\d{8}")
+
 # Only the WHERE clauses of the top-level statement are analysed: time
 # filters in subqueries, JOIN ON clauses and HAVING do not bound the
 # rows a plain SELECT can match.
@@ -118,6 +134,13 @@ class _Token:
     kind: str  # "name", "string", "number" or "op"
     text: str
     quoted: bool = False
+
+
+@dataclass
+class _TimeValue:
+    us: int  # microseconds since the epoch
+    date_only: bool  # a day-granular literal, like '2024-01-01'
+    typed: bool  # an explicit timestamp conversion, not a bare string
 
 
 def _kw(token: _Token) -> str:
@@ -195,7 +218,7 @@ def _tokenize(sql: str) -> list[_Token]:
     return tokens
 
 
-def _datetime_us(text: str) -> int | None:
+def _parse_datetime(text: str, typed: bool = False) -> _TimeValue | None:
     # Python 3.11 parses most ISO 8601: space or "T" separator, "Z" and
     # numeric offsets; naive strings are read as UTC.
     value = re.sub(r"(\.\d{6})\d+", r"\g<1>", text.strip())
@@ -205,7 +228,11 @@ def _datetime_us(text: str) -> int | None:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return _delta_us(parsed)
+    return _TimeValue(
+        _delta_us(parsed),
+        _DATE_ONLY.fullmatch(value) is not None,
+        typed,
+    )
 
 
 def _now_us() -> int:
@@ -225,7 +252,7 @@ def _interval_us(text: str) -> int | None:
     return total
 
 
-def _time_value(tokens: list[_Token]) -> int | None:
+def _time_value(tokens: list[_Token]) -> _TimeValue | None:
     if not tokens:
         return None
     if (
@@ -239,23 +266,22 @@ def _time_value(tokens: list[_Token]) -> int | None:
         span = _interval_us(tokens[-1].text)
         if base is None or span is None:
             return None
-        if tokens[-3].text == "+":
-            return base + span
-        return base - span
+        us = base.us + span if tokens[-3].text == "+" else base.us - span
+        return _TimeValue(us, False, True)
     return _base_time_value(tokens)
 
 
-def _base_time_value(tokens: list[_Token]) -> int | None:
+def _base_time_value(tokens: list[_Token]) -> _TimeValue | None:
     if len(tokens) == 1 and tokens[0].kind == "string":
-        return _datetime_us(tokens[0].text)
+        return _parse_datetime(tokens[0].text)
     if (
         len(tokens) == 2
         and tokens[1].kind == "string"
         and _kw(tokens[0]) in ("TIMESTAMP", "DATE")
     ):
-        return _datetime_us(tokens[1].text)
+        return _parse_datetime(tokens[1].text, typed=True)
     if len(tokens) == 1 and _kw(tokens[0]) == "CURRENT_TIMESTAMP":
-        return _now_us()
+        return _TimeValue(_now_us(), False, True)
     if (
         len(tokens) == 3
         and _kw(tokens[0]) in _NOW_NAMES
@@ -264,14 +290,14 @@ def _base_time_value(tokens: list[_Token]) -> int | None:
         and tokens[2].kind == "op"
         and tokens[2].text == ")"
     ):
-        return _now_us()
-    cast = _cast_us(tokens)
+        return _TimeValue(_now_us(), False, True)
+    cast = _cast_value(tokens)
     if cast is not None:
         return cast
-    return _to_timestamp_us(tokens)
+    return _to_timestamp_value(tokens)
 
 
-def _cast_us(tokens: list[_Token]) -> int | None:
+def _cast_value(tokens: list[_Token]) -> _TimeValue | None:
     if (
         len(tokens) >= 6
         and _kw(tokens[0]) == "CAST"
@@ -298,11 +324,11 @@ def _cast_us(tokens: list[_Token]) -> int | None:
                 and rest[2].text == ")"
             ):
                 if typ.startswith("TIMESTAMP") or typ == "DATE":
-                    return _datetime_us(inner[0].text)
+                    return _parse_datetime(inner[0].text, typed=True)
     return None
 
 
-def _to_timestamp_us(tokens: list[_Token]) -> int | None:
+def _to_timestamp_value(tokens: list[_Token]) -> _TimeValue | None:
     if (
         len(tokens) >= 4
         and tokens[0].kind == "name"
@@ -317,7 +343,7 @@ def _to_timestamp_us(tokens: list[_Token]) -> int | None:
             args = _split_commas(tokens[2:-1])
             if len(args) <= 2 and len(args[0]) == 1:
                 if args[0][0].kind == "string":
-                    return _datetime_us(args[0][0].text)
+                    return _parse_datetime(args[0][0].text, typed=True)
     return None
 
 
@@ -361,22 +387,68 @@ def _timeish(tokens: list[_Token]) -> bool:
     if not parts:
         return False
     name = parts[-1].lower()
-    return "time" in name or "date" in name or name in ("ts", "dttm")
+    return "time" in name or "date" in name or name in ("ts", "dttm", "day")
 
 
-def _bounds(op: str, value: int) -> tuple[int | None, int | None]:
+def _time_operand(tokens: list[_Token]) -> bool:
+    # Whether the non-literal side of a comparison looks like time
+    # itself: a time-like column name, a call to a known time function,
+    # or a cast of a time-like column. Anything else, and a bare string
+    # beside it is just a string comparison.
+    if _timeish(tokens):
+        return True
+    if (
+        len(tokens) >= 4
+        and tokens[0].kind == "name"
+        and not tokens[0].quoted
+        and tokens[1].kind == "op"
+        and tokens[1].text == "("
+        and tokens[-1].kind == "op"
+        and tokens[-1].text == ")"
+    ):
+        name = tokens[0].text.lower()
+        if name in _TIME_FUNCTIONS or name.startswith("to_timestamp"):
+            return True
+        if name == "cast":
+            inner = tokens[2:-1]
+            depth = 0
+            for i, token in enumerate(inner):
+                if token.kind == "op":
+                    if token.text == "(":
+                        depth += 1
+                    elif token.text == ")":
+                        depth -= 1
+                    continue
+                if depth == 0 and _kw(token) == "AS":
+                    return _timeish(inner[:i])
+    return False
+
+
+def _epoch_value(tokens: list[_Token]) -> _TimeValue | None:
+    number = _epoch_int(tokens)
+    if number is None:
+        return None
+    scaled = _scale_epoch(number)
+    if scaled is None:
+        return None
+    return _TimeValue(scaled, False, True)
+
+
+def _bounds(op: str, value: _TimeValue) -> tuple[int | None, int | None]:
     # Bounds are inclusive below and exclusive above, like the filter
-    # OpenObserve itself applies.
+    # OpenObserve itself applies; a day-granular literal covers its
+    # whole day on the inclusive upper side.
+    end = value.us + (_DAY_US if value.date_only else 1)
     if op == ">=":
-        return value, None
+        return value.us, None
     if op == ">":
-        return value + 1, None
+        return value.us + 1, None
     if op == "<=":
-        return None, value + 1
+        return None, end
     if op == "<":
-        return None, value
+        return None, value.us
     if op == "=":
-        return value, value + 1
+        return value.us, end
     return None, None
 
 
@@ -529,34 +601,40 @@ def _predicate(tokens: list[_Token]) -> tuple[int | None, int | None]:
 def _comparison(
     lhs: list[_Token], op: str, rhs: list[_Token]
 ) -> tuple[int | None, int | None]:
+    # A typed timestamp bounds the range against anything it is
+    # compared with, but a bare string only against a time-like side,
+    # so that a string comparison on an ordinary column cannot narrow
+    # the range.
     left = _time_value(lhs)
     right = _time_value(rhs)
     if left is not None and right is None:
-        return _bounds(_FLIP[op], left)
+        if left.typed or _time_operand(rhs):
+            return _bounds(_FLIP[op], left)
+        return None, None
     if right is not None and left is None:
-        return _bounds(op, right)
-    left_int = _epoch_int(lhs)
-    right_int = _epoch_int(rhs)
-    if left_int is not None and _timeish(rhs):
-        scaled = _scale_epoch(left_int)
-        if scaled is not None:
-            return _bounds(_FLIP[op], scaled)
-    if right_int is not None and _timeish(lhs):
-        scaled = _scale_epoch(right_int)
-        if scaled is not None:
-            return _bounds(op, scaled)
+        if right.typed or _time_operand(lhs):
+            return _bounds(op, right)
+        return None, None
+    left_epoch = _epoch_value(lhs)
+    right_epoch = _epoch_value(rhs)
+    if left_epoch is not None and _timeish(rhs):
+        return _bounds(_FLIP[op], left_epoch)
+    if right_epoch is not None and _timeish(lhs):
+        return _bounds(op, right_epoch)
     return None, None
 
 
 def _side_value(
     tokens: list[_Token], operand: list[_Token]
-) -> int | None:
+) -> _TimeValue | None:
     value = _time_value(tokens)
     if value is not None:
-        return value
-    number = _epoch_int(tokens)
-    if number is not None and _timeish(operand):
-        return _scale_epoch(number)
+        if value.typed or _time_operand(operand):
+            return value
+        return None
+    epoch = _epoch_value(tokens)
+    if epoch is not None and _timeish(operand):
+        return epoch
     return None
 
 
@@ -584,7 +662,8 @@ def _set_predicate(tokens: list[_Token]) -> tuple[int | None, int | None]:
             high = _side_value(parts[1], operand)
             if low is None or high is None:
                 return None, None
-            interval = (low, high + 1)
+            end = high.us + (_DAY_US if high.date_only else 1)
+            interval = (low.us, end)
             return _complement(interval) if negated else interval
         group = tokens[i + 1 :]
         if (
@@ -595,7 +674,7 @@ def _set_predicate(tokens: list[_Token]) -> tuple[int | None, int | None]:
             and group[-1].text == ")"
             and _is_wrapped(group)
         ):
-            values: list[int] = []
+            values: list[_TimeValue] = []
             complete = True
             for item in _split_commas(group[1:-1]):
                 value = _side_value(item, operand)
@@ -604,7 +683,9 @@ def _set_predicate(tokens: list[_Token]) -> tuple[int | None, int | None]:
                     break
                 values.append(value)
             if complete and values:
-                interval = (min(values), max(values) + 1)
+                top = max(values, key=lambda item: item.us)
+                end = top.us + (_DAY_US if top.date_only else 1)
+                interval = (min(item.us for item in values), end)
                 return _complement(interval) if negated else interval
         return None, None
     return None, None
@@ -669,10 +750,15 @@ def extract_time_range(sql: str) -> tuple[int, int]:
     zero) and end to now plus an hour.
 
     A timestamp is any ISO 8601 literal string, with or without CAST,
-    to_timestamp or TIMESTAMP/DATE typing, and ``now()`` plus or minus an
-    INTERVAL. A bare integer is read as an epoch in seconds,
-    milliseconds, microseconds or nanoseconds by its digit count, and
-    only when it is compared against a column with a time-like name.
+    to_timestamp or TIMESTAMP/DATE typing, and ``now()`` plus or minus
+    an INTERVAL. A typed timestamp bounds the range against whatever it
+    is compared with, but a bare string only against a column with a
+    time-like name or a time function of one, so that a string
+    comparison on an ordinary column cannot narrow the range. A
+    date-only literal, like '2024-01-01', covers its whole day on the
+    inclusive upper side. A bare integer is read as an epoch in
+    seconds, milliseconds, microseconds or nanoseconds by its digit
+    count, again only against a time-like column name.
     """
     low, high = _analyze(sql)
     if low is None or low < 1:
