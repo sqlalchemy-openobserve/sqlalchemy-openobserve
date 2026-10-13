@@ -34,8 +34,39 @@ Python 3.11 or newer, SQLAlchemy 2.0.52 or newer in the 2.0 series.
 
 ```bash
 pip install -e ".[dev]"
+```
+
+The checks that CI runs on every pull request:
+
+```bash
+ruff check .
+ruff format --check .
+mypy --strict src
 pytest
 ```
+
+### A local OpenObserve
+
+To try code against a real server, start OpenObserve in Docker and load the
+sample data:
+
+```bash
+docker compose up -d
+python3 scripts/load_sample_data.py
+```
+
+This gives you a logs stream named `app_logs` with 3,000 rows from the last
+48 hours. Running the script again adds another 3,000 rows.
+
+| | |
+|---|---|
+| URL | http://localhost:5080 |
+| Organization | `default` |
+| Email | `root@example.com` |
+| Password | `Complexpass#123` |
+
+The web UI is at the same URL. Stop the server, and delete its data, with
+`docker compose down`.
 
 ## Licence
 
