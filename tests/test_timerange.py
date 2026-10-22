@@ -142,6 +142,76 @@ def test_not_between_is_wide() -> None:
     assert high >= now_us()
 
 
+# NOT distributes over the connective it negates, by De Morgan: a
+# time filter negated alongside another predicate cannot cut off the
+# rows that still match through it.
+
+
+def test_not_mixed_conjunction_stays_wide() -> None:
+    # NOT (ts >= a AND region = 'us') still matches rows at any ts
+    # through region != 'us'
+    sql = (
+        "SELECT * FROM t WHERE NOT (ts >= '2024-01-01' "
+        "AND region = 'us')"
+    )
+    low, high = extract_time_range(sql)
+    assert low == 1
+    assert high >= now_us()
+
+
+def test_not_mixed_conjunction_wrapped_stays_wide() -> None:
+    sql = (
+        "SELECT * FROM t WHERE NOT "
+        "((ts >= '2024-01-01' AND region = 'us'))"
+    )
+    low, high = extract_time_range(sql)
+    assert low == 1
+    assert high >= now_us()
+
+
+def test_not_both_time_bounds_stays_wide() -> None:
+    # Rows outside the window can lie on either side of it
+    sql = (
+        "SELECT * FROM t WHERE NOT "
+        "(ts >= '2024-01-01' AND ts < '2024-02-01')"
+    )
+    low, high = extract_time_range(sql)
+    assert low == 1
+    assert high >= now_us()
+
+
+def test_not_distributes_over_and() -> None:
+    # NOT (ts >= a AND ts >= b) == ts < a OR ts < b == ts < max(a, b)
+    sql = (
+        "SELECT * FROM t WHERE NOT (ts >= '2024-01-01' "
+        "AND ts >= '2024-02-01')"
+    )
+    low, high = extract_time_range(sql)
+    assert low == 1
+    assert high == us(2024, 2, 1)
+
+
+def test_not_distributes_over_or() -> None:
+    # NOT (ts < a OR ts >= b) == ts >= a AND ts < b
+    sql = (
+        "SELECT * FROM t WHERE NOT (ts < '2024-01-01' "
+        "OR ts >= '2024-02-01')"
+    )
+    assert extract_time_range(sql) == (us(2024, 1, 1), us(2024, 2, 1))
+
+
+def test_not_mixed_disjunction_bounds_other_side() -> None:
+    # NOT (ts >= a OR region = 'us') == ts < a AND region != 'us':
+    # every row the SQL matches has ts < a
+    sql = (
+        "SELECT * FROM t WHERE NOT (ts >= '2024-01-01' "
+        "OR region = 'us')"
+    )
+    low, high = extract_time_range(sql)
+    assert low == 1
+    assert high == us(2024, 1, 1)
+
+
 def test_or_takes_widest() -> None:
     sql = "SELECT * FROM t WHERE ts >= '2024-01-01' OR ts >= '2023-06-01'"
     low, _ = extract_time_range(sql)
@@ -167,6 +237,42 @@ def test_contradictory_bounds_stay_ordered() -> None:
     sql = "SELECT * FROM t WHERE ts >= '2024-02-01' AND ts < '2024-01-01'"
     low, high = extract_time_range(sql)
     assert (low, high) == (us(2024, 2, 1), us(2024, 2, 1) + 1)
+
+
+# A lower bound in the future matches rows that no horizon based on
+# now can cover: the end falls back to the far future instead of
+# collapsing onto the start.
+
+
+def test_future_lower_bound_stays_open() -> None:
+    sql = "SELECT * FROM t WHERE ts >= '2030-01-01'"
+    low, high = extract_time_range(sql)
+    assert low == us(2030, 1, 1)
+    assert high == us(2100, 1, 1)
+
+
+def test_future_lower_bound_interval_stays_open() -> None:
+    sql = "SELECT * FROM t WHERE ts >= now() + INTERVAL '1 month'"
+    before = now_us()
+    low, high = extract_time_range(sql)
+    after = now_us()
+    assert before + 31 * DAY <= low <= after + 31 * DAY
+    assert high == us(2100, 1, 1)
+
+
+def test_future_lower_bound_epoch_stays_open() -> None:
+    sql = f"SELECT * FROM t WHERE _timestamp >= {us(2080, 1, 1)}"
+    low, high = extract_time_range(sql)
+    assert low == us(2080, 1, 1)
+    assert high == us(2100, 1, 1)
+
+
+def test_future_bounds_resolved_is_exact() -> None:
+    sql = (
+        "SELECT * FROM t WHERE ts >= '2030-01-01' "
+        "AND ts < '2031-01-01'"
+    )
+    assert extract_time_range(sql) == (us(2030, 1, 1), us(2031, 1, 1))
 
 
 def test_cast_forms() -> None:
