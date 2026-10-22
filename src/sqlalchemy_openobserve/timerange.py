@@ -565,7 +565,7 @@ def _parse_bool(tokens: list[_Token]) -> tuple[int | None, int | None]:
             result = _and_intersect(result, _parse_bool(part))
         return result
     if _kw(tokens[0]) == "NOT" and len(tokens) > 1:
-        return _complement(_parse_bool(tokens[1:]))
+        return _negate(tokens[1:])
     if (
         tokens[0].kind == "op"
         and tokens[0].text == "("
@@ -576,6 +576,36 @@ def _parse_bool(tokens: list[_Token]) -> tuple[int | None, int | None]:
             return None, None
         return _parse_bool(inner)
     return _predicate(tokens)
+
+
+def _negate(tokens: list[_Token]) -> tuple[int | None, int | None]:
+    # NOT distributes over the connective it negates, by De Morgan:
+    # NOT (a AND b) is NOT a OR NOT b, and NOT (a OR b) is NOT a
+    # AND NOT b. Complementing the combined window instead would
+    # narrow a mixed conjunction, whose other conjunct leaves the
+    # rows it still matches unbounded in time.
+    while (
+        len(tokens) >= 2
+        and tokens[0].kind == "op"
+        and tokens[0].text == "("
+        and tokens[-1].kind == "op"
+        and tokens[-1].text == ")"
+        and _is_wrapped(tokens)
+    ):
+        inner = tokens[1:-1]
+        if inner and _kw(inner[0]) == "SELECT":
+            break
+        tokens = inner
+    or_parts = _split_keyword(tokens, "OR")
+    if len(or_parts) > 1:
+        result: tuple[int | None, int | None] = (None, None)
+        for part in or_parts:
+            result = _and_intersect(result, _complement(_parse_bool(part)))
+        return result
+    and_parts = _split_keyword(tokens, "AND")
+    if len(and_parts) > 1:
+        return _or_all([_complement(_parse_bool(p)) for p in and_parts])
+    return _complement(_parse_bool(tokens))
 
 
 def _predicate(tokens: list[_Token]) -> tuple[int | None, int | None]:
@@ -744,10 +774,13 @@ def extract_time_range(sql: str) -> tuple[int, int]:
 
     Start and end are worked out from the time comparisons in the
     statement's WHERE clause, with AND keeping the narrowest window, OR
-    the widest, and NOT turning a one-sided bound into the other side.
-    A comparison that cannot be resolved leaves that side of the range
-    open: start falls back to just after the epoch (the API rejects
-    zero) and end to now plus an hour.
+    the widest, and NOT distributing over the connective it negates,
+    De Morgan style, so a negated time filter cannot cut off rows that
+    still match through another predicate. A comparison that cannot
+    be resolved leaves that side of the range open: start falls back
+    to just after the epoch (the API rejects zero) and end to now plus
+    an hour, or to the far future when the start itself lies in the
+    future, since no horizon based on now covers the rows it matches.
 
     A timestamp is any ISO 8601 literal string, with or without CAST,
     to_timestamp or TIMESTAMP/DATE typing, and ``now()`` plus or minus
@@ -764,7 +797,16 @@ def extract_time_range(sql: str) -> tuple[int, int]:
     if low is None or low < 1:
         low = 1
     if high is None:
-        high = _now_us() + _MARGIN_US
-    if high <= low:
+        now = _now_us()
+        high = now + _MARGIN_US
+        if low > now:
+            # A lower bound in the future matches rows that no
+            # horizon based on now can cover: the end goes to the
+            # far future instead of collapsing onto the start.
+            high = max(low + 1, _EPOCH_MAX_US)
+    elif high <= low:
+        # Both bounds resolved with the end at or before the
+        # start: the SQL cannot match anything, so any window is
+        # safe, and the smallest one keeps the search cheap.
         high = low + 1
     return low, high
