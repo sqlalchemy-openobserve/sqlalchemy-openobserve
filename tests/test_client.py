@@ -4,7 +4,11 @@ import pytest
 import requests
 
 from sqlalchemy_openobserve import client as client_module
-from sqlalchemy_openobserve.client import OpenObserveClient, OpenObserveError
+from sqlalchemy_openobserve.client import (
+    OpenObserveClient,
+    OpenObserveError,
+    QueryError,
+)
 
 
 @pytest.fixture
@@ -22,11 +26,20 @@ def client(session: Mock) -> OpenObserveClient:
 def test_search_posts_query_with_basic_auth(
     session: Mock, client: OpenObserveClient
 ) -> None:
-    session.request.return_value.json.return_value = {"hits": []}
+    session.request.return_value.json.return_value = {
+        "columns": ["level"],
+        "hits": [{"level": "info"}],
+        "is_partial": True,
+        "total": 1,
+    }
 
     result = client.search("select * from logs", 10, 20)
 
-    assert result == {"hits": []}
+    assert result == {
+        "columns": ["level"],
+        "rows": [{"level": "info"}],
+        "is_partial": True,
+    }
     assert session.auth == ("user", "pass")
     session.request.assert_called_once_with(
         "POST",
@@ -39,9 +52,19 @@ def test_search_posts_query_with_basic_auth(
                 "end_time": 20,
                 "from": 0,
                 "size": 1000,
+                "query_type": "table",
             }
         },
     )
+
+
+def test_search_raises_query_error_for_http_200_error(
+    session: Mock, client: OpenObserveClient
+) -> None:
+    session.request.return_value.json.return_value = {"error": "invalid SQL"}
+
+    with pytest.raises(QueryError, match="invalid SQL"):
+        client.search("select * from", 10, 20)
 
 
 def test_list_streams_returns_stream_names(
@@ -57,20 +80,79 @@ def test_list_streams_returns_stream_names(
         "GET",
         "https://observe.example:5080/api/my%20org/streams",
         timeout=30,
+        params={"type": "logs"},
+    )
+
+
+def test_list_streams_accepts_stream_type(
+    session: Mock, client: OpenObserveClient
+) -> None:
+    session.request.return_value.json.return_value = {
+        "list": [{"name": "cpu"}],
+        "total": 1,
+    }
+
+    assert client.list_streams("metrics") == ["cpu"]
+
+    session.request.assert_called_once_with(
+        "GET",
+        "https://observe.example:5080/api/my%20org/streams",
+        timeout=30,
+        params={"type": "metrics"},
     )
 
 
 def test_stream_schema_quotes_stream_name(
     session: Mock, client: OpenObserveClient
 ) -> None:
-    session.request.return_value.json.return_value = {"schema": []}
+    session.request.return_value.json.return_value = {
+        "schema": [
+            {"name": "_timestamp", "type": "Int64", "nullable": False},
+            {"name": "message", "type": "Utf8", "nullable": True},
+        ],
+        "total_fields": 2,
+    }
 
-    assert client.stream_schema("app/logs") == {"schema": []}
+    assert client.stream_schema("app/logs") == [
+        {"name": "_timestamp", "type": "Int64"},
+        {"name": "message", "type": "Utf8"},
+    ]
     session.request.assert_called_once_with(
         "GET",
         "https://observe.example:5080/api/my%20org/streams/app%2Flogs/schema",
         timeout=30,
+        params={"type": "logs"},
     )
+
+
+def test_stream_schema_accepts_stream_type(
+    session: Mock, client: OpenObserveClient
+) -> None:
+    session.request.return_value.json.return_value = {
+        "schema": [{"name": "cpu", "type": "Float64"}]
+    }
+
+    assert client.stream_schema("cpu", "traces") == [
+        {"name": "cpu", "type": "Float64"}
+    ]
+
+    session.request.assert_called_once_with(
+        "GET",
+        "https://observe.example:5080/api/my%20org/streams/cpu/schema",
+        timeout=30,
+        params={"type": "traces"},
+    )
+
+
+def test_stream_schema_rejects_invalid_fields(
+    session: Mock, client: OpenObserveClient
+) -> None:
+    session.request.return_value.json.return_value = {
+        "schema": [{"name": "message"}]
+    }
+
+    with pytest.raises(OpenObserveError, match="invalid field"):
+        client.stream_schema("app_logs")
 
 
 def test_http_errors_are_reported_as_client_errors(

@@ -1,13 +1,19 @@
 """HTTP client for the OpenObserve API"""
 
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 
 import requests
 
+StreamType = Literal["logs", "metrics", "traces"]
+
 
 class OpenObserveError(Exception):
     """An OpenObserve request failed or returned an invalid response."""
+
+
+class QueryError(OpenObserveError):
+    """OpenObserve rejected a query."""
 
 
 class OpenObserveClient:
@@ -67,6 +73,7 @@ class OpenObserveClient:
                     "end_time": end_time,
                     "from": 0,
                     "size": size,
+                    "query_type": "table",
                 }
             },
         )
@@ -74,10 +81,16 @@ class OpenObserveClient:
             raise OpenObserveError(
                 "OpenObserve search response must be an object"
             )
-        return result
+        if "error" in result:
+            raise QueryError(str(result["error"]))
+        return {
+            "columns": result.get("columns", []),
+            "rows": result.get("hits", result.get("rows", [])),
+            "is_partial": result.get("is_partial", False),
+        }
 
-    def list_streams(self) -> list[str]:
-        result = self._request("GET", "streams")
+    def list_streams(self, stream_type: StreamType = "logs") -> list[str]:
+        result = self._request("GET", "streams", params={"type": stream_type})
         if not isinstance(result, dict) or not isinstance(
             result.get("list"), list
         ):
@@ -100,15 +113,32 @@ class OpenObserveClient:
         """Check connectivity by listing streams in the organization."""
         self.list_streams()
 
-    def stream_schema(self, stream: str) -> dict[str, Any]:
+    def stream_schema(
+        self, stream: str, stream_type: StreamType = "logs"
+    ) -> list[dict[str, Any]]:
         result = self._request(
-            "GET", f"streams/{quote(stream, safe='')}/schema"
+            "GET",
+            f"streams/{quote(stream, safe='')}/schema",
+            params={"type": stream_type},
         )
-        if not isinstance(result, dict):
+        if not isinstance(result, dict) or not isinstance(
+            result.get("schema"), list
+        ):
             raise OpenObserveError(
-                "OpenObserve stream schema response must be an object"
+                "OpenObserve stream schema response must contain a list"
             )
-        return result
+        fields: list[dict[str, Any]] = []
+        for field in result["schema"]:
+            if (
+                not isinstance(field, dict)
+                or not isinstance(field.get("name"), str)
+                or not isinstance(field.get("type"), str)
+            ):
+                raise OpenObserveError(
+                    "OpenObserve stream schema contains an invalid field"
+                )
+            fields.append({"name": field["name"], "type": field["type"]})
+        return fields
 
     def close(self) -> None:
         """Close the underlying HTTP session."""
