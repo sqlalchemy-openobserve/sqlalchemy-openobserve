@@ -95,6 +95,27 @@ def test_non_list_stream_response_is_rejected(
         client.list_streams()
 
 
+def test_ping_checks_connection_by_listing_streams(
+    monkeypatch: pytest.MonkeyPatch, client: OpenObserveClient
+) -> None:
+    list_streams = Mock(return_value=["app_logs"])
+    monkeypatch.setattr(client, "list_streams", list_streams)
+
+    assert client.ping() is None
+
+    list_streams.assert_called_once_with()
+
+
+def test_ping_propagates_stream_list_errors(
+    monkeypatch: pytest.MonkeyPatch, client: OpenObserveClient
+) -> None:
+    list_streams = Mock(side_effect=OpenObserveError("connection failed"))
+    monkeypatch.setattr(client, "list_streams", list_streams)
+
+    with pytest.raises(OpenObserveError, match="connection failed"):
+        client.ping()
+
+
 def test_ssl_can_be_disabled(session: Mock) -> None:
     client = OpenObserveClient(
         "localhost", 5080, "default", "user", "pass", ssl=False

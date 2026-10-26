@@ -96,6 +96,10 @@ class OpenObserveClient:
             names.append(stream["name"])
         return names
 
+    def ping(self) -> None:
+        """Check connectivity by listing streams in the organization."""
+        self.list_streams()
+
     def stream_schema(self, stream: str) -> dict[str, Any]:
         result = self._request(
             "GET", f"streams/{quote(stream, safe='')}/schema"
