@@ -54,7 +54,7 @@ class OpenObserveClient:
             ) from exc
 
     def search(
-        self, sql: str, start_time: int, end_time: int
+        self, sql: str, start_time: int, end_time: int, size: int = 1000
     ) -> dict[str, Any]:
         """Run a query. Times are microseconds since the epoch."""
         result = self._request(
@@ -66,7 +66,7 @@ class OpenObserveClient:
                     "start_time": start_time,
                     "end_time": end_time,
                     "from": 0,
-                    "size": 1000,
+                    "size": size,
                 }
             },
         )
