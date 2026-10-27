@@ -4,8 +4,12 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-_MARGIN_US = 3_600_000_000
+_HOUR_US = 3_600_000_000
 _DAY_US = 86_400_000_000
+# OpenObserve ingests nothing stamped further ahead than 24 hours, so
+# no row can lie further ahead of now than that; the slack covers
+# clock skew between the client and the server.
+_FUTURE_MARGIN_US = 25 * _HOUR_US
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -18,46 +22,48 @@ def _delta_us(value: datetime) -> int:
     )
 
 
-# Bare epoch integers are guessed from their digit count; anything outside
-# this window is treated as an ordinary number.
+# A bare integer only counts as an epoch inside this window; outside
+# it is an ordinary number, and bounds nothing.
 _EPOCH_MIN_US = _delta_us(datetime(1990, 1, 1, tzinfo=timezone.utc))
 _EPOCH_MAX_US = _delta_us(datetime(2100, 1, 1, tzinfo=timezone.utc))
 
-# Months and years have no fixed length, so the longest one is used: it
-# keeps interval arithmetic from cutting into the real window.
-_INTERVAL_US: dict[str, int] = {
-    "microsecond": 1,
-    "microseconds": 1,
-    "us": 1,
-    "millisecond": 1_000,
-    "milliseconds": 1_000,
-    "ms": 1_000,
-    "second": 1_000_000,
-    "seconds": 1_000_000,
-    "sec": 1_000_000,
-    "secs": 1_000_000,
-    "s": 1_000_000,
-    "minute": 60_000_000,
-    "minutes": 60_000_000,
-    "min": 60_000_000,
-    "mins": 60_000_000,
-    "hour": 3_600_000_000,
-    "hours": 3_600_000_000,
-    "hr": 3_600_000_000,
-    "hrs": 3_600_000_000,
-    "day": 86_400_000_000,
-    "days": 86_400_000_000,
-    "d": 86_400_000_000,
-    "week": 604_800_000_000,
-    "weeks": 604_800_000_000,
-    "w": 604_800_000_000,
-    "month": 31 * 86_400_000_000,
-    "months": 31 * 86_400_000_000,
-    "year": 366 * 86_400_000_000,
-    "years": 366 * 86_400_000_000,
-    "y": 366 * 86_400_000_000,
-    "yr": 366 * 86_400_000_000,
-    "yrs": 366 * 86_400_000_000,
+# Months and years have no fixed length, so each unit carries its
+# shortest and its longest: the shortest goes into a lower bound and
+# the longest into an upper one, each widened whichever way cannot
+# cut into the real window. The fixed units carry one length twice.
+_INTERVAL_US: dict[str, tuple[int, int]] = {
+    "microsecond": (1, 1),
+    "microseconds": (1, 1),
+    "us": (1, 1),
+    "millisecond": (1_000, 1_000),
+    "milliseconds": (1_000, 1_000),
+    "ms": (1_000, 1_000),
+    "second": (1_000_000, 1_000_000),
+    "seconds": (1_000_000, 1_000_000),
+    "sec": (1_000_000, 1_000_000),
+    "secs": (1_000_000, 1_000_000),
+    "s": (1_000_000, 1_000_000),
+    "minute": (60_000_000, 60_000_000),
+    "minutes": (60_000_000, 60_000_000),
+    "min": (60_000_000, 60_000_000),
+    "mins": (60_000_000, 60_000_000),
+    "hour": (_HOUR_US, _HOUR_US),
+    "hours": (_HOUR_US, _HOUR_US),
+    "hr": (_HOUR_US, _HOUR_US),
+    "hrs": (_HOUR_US, _HOUR_US),
+    "day": (_DAY_US, _DAY_US),
+    "days": (_DAY_US, _DAY_US),
+    "d": (_DAY_US, _DAY_US),
+    "week": (7 * _DAY_US, 7 * _DAY_US),
+    "weeks": (7 * _DAY_US, 7 * _DAY_US),
+    "w": (7 * _DAY_US, 7 * _DAY_US),
+    "month": (28 * _DAY_US, 31 * _DAY_US),
+    "months": (28 * _DAY_US, 31 * _DAY_US),
+    "year": (365 * _DAY_US, 366 * _DAY_US),
+    "years": (365 * _DAY_US, 366 * _DAY_US),
+    "y": (365 * _DAY_US, 366 * _DAY_US),
+    "yr": (365 * _DAY_US, 366 * _DAY_US),
+    "yrs": (365 * _DAY_US, 366 * _DAY_US),
 }
 
 _TWO_CHAR_OPS = (">=", "<=", "<>", "!=", "::", "||")
@@ -74,59 +80,23 @@ _FLIP = {
     "<>": "<>",
     "!=": "!=",
 }
+_INVERT = {
+    ">=": "<",
+    ">": "<=",
+    "<": ">=",
+    "<=": ">",
+    "=": "!=",
+    "!=": "=",
+    "<>": "=",
+}
+
+# Set operators combine the branches of a statement.
+_COMPOUND_OPS = frozenset({"UNION", "EXCEPT", "INTERSECT"})
 
 _NOW_NAMES = ("NOW", "CURRENT_TIMESTAMP")
 
-# Functions that only ever make sense on a time-like expression
-_TIME_FUNCTIONS = frozenset(
-    {
-        "date_bin",
-        "date_format",
-        "date_trunc",
-        "from_unixtime",
-        "histogram",
-        "strftime",
-    }
-)
-
 # A day-granular literal, like '2024-01-01', covers its whole day
 _DATE_ONLY = re.compile(r"\d{4}-\d{2}-\d{2}|\d{8}")
-
-# Only the WHERE clauses of the top-level statement are analysed: time
-# filters in subqueries, JOIN ON clauses and HAVING do not bound the
-# rows a plain SELECT can match.
-_CLAUSE_STOPS = frozenset(
-    {
-        "GROUP",
-        "ORDER",
-        "LIMIT",
-        "OFFSET",
-        "HAVING",
-        "UNION",
-        "EXCEPT",
-        "INTERSECT",
-        "WINDOW",
-        "QUALIFY",
-        "SELECT",
-        "FROM",
-        "WITH",
-        "FOR",
-        "JOIN",
-        "ON",
-        "USING",
-        "WHERE",
-        "CROSS",
-        "INNER",
-        "LEFT",
-        "RIGHT",
-        "FULL",
-        "NATURAL",
-        "VALUES",
-        "SET",
-        "INTO",
-        "RETURNING",
-    }
-)
 
 
 @dataclass
@@ -140,11 +110,10 @@ class _Token:
 class _TimeValue:
     us: int  # microseconds since the epoch
     date_only: bool  # a day-granular literal, like '2024-01-01'
-    typed: bool  # an explicit timestamp conversion, not a bare string
 
 
-def _kw(token: _Token) -> str:
-    if token.kind == "name" and not token.quoted:
+def _kw(token: _Token | None) -> str:
+    if token is not None and token.kind == "name" and not token.quoted:
         return token.text.upper()
     return ""
 
@@ -215,9 +184,9 @@ def _tokenize(sql: str) -> list[_Token]:
     return tokens
 
 
-def _parse_datetime(text: str, typed: bool = False) -> _TimeValue | None:
-    # Python 3.11 parses most ISO 8601: space or "T" separator, "Z" and
-    # numeric offsets; naive strings are read as UTC.
+def _parse_datetime(text: str) -> _TimeValue | None:
+    # Python 3.11 parses most ISO 8601: space or "T" separator, "Z"
+    # and numeric offsets; naive strings are read as UTC.
     value = re.sub(r"(\.\d{6})\d+", r"\g<1>", text.strip())
     try:
         parsed = datetime.fromisoformat(value)
@@ -226,9 +195,7 @@ def _parse_datetime(text: str, typed: bool = False) -> _TimeValue | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return _TimeValue(
-        _delta_us(parsed),
-        _DATE_ONLY.fullmatch(value) is not None,
-        typed,
+        _delta_us(parsed), _DATE_ONLY.fullmatch(value) is not None
     )
 
 
@@ -236,20 +203,24 @@ def _now_us() -> int:
     return _delta_us(datetime.now(timezone.utc))
 
 
-def _interval_us(text: str) -> int | None:
+def _interval_us(text: str, longest: bool) -> int | None:
     pairs = re.findall(r"(\d+(?:\.\d+)?)\s*([a-zA-Z]+)", text)
     if not pairs:
         return None
     total = 0
     for value, unit in pairs:
-        factor = _INTERVAL_US.get(unit.lower())
-        if factor is None:
+        span = _INTERVAL_US.get(unit.lower())
+        if span is None:
             return None
-        total += int(float(value) * factor)
+        total += int(float(value) * (span[1] if longest else span[0]))
     return total
 
 
-def _time_value(tokens: list[_Token]) -> _TimeValue | None:
+def _time_value(tokens: list[_Token], side: str) -> _TimeValue | None:
+    # A literal plus or minus an INTERVAL. Which length a month or a
+    # year takes depends on the side the bound is bound for: the
+    # shortest keeps a lower bound under the real one and the longest
+    # keeps an upper bound over it, whichever way the INTERVAL goes.
     if not tokens:
         return None
     if (
@@ -259,12 +230,14 @@ def _time_value(tokens: list[_Token]) -> _TimeValue | None:
         and tokens[-3].kind == "op"
         and tokens[-3].text in ("+", "-")
     ):
-        base = _time_value(tokens[:-3])
-        span = _interval_us(tokens[-1].text)
+        longest = (side == "high") == (tokens[-3].text == "+")
+        base = _time_value(tokens[:-3], side)
+        span = _interval_us(tokens[-1].text, longest)
         if base is None or span is None:
             return None
-        us = base.us + span if tokens[-3].text == "+" else base.us - span
-        return _TimeValue(us, False, True)
+        if tokens[-3].text == "+":
+            return _TimeValue(base.us + span, False)
+        return _TimeValue(base.us - span, False)
     return _base_time_value(tokens)
 
 
@@ -276,9 +249,9 @@ def _base_time_value(tokens: list[_Token]) -> _TimeValue | None:
         and tokens[1].kind == "string"
         and _kw(tokens[0]) in ("TIMESTAMP", "DATE")
     ):
-        return _parse_datetime(tokens[1].text, typed=True)
+        return _parse_datetime(tokens[1].text)
     if len(tokens) == 1 and _kw(tokens[0]) == "CURRENT_TIMESTAMP":
-        return _TimeValue(_now_us(), False, True)
+        return _TimeValue(_now_us(), False)
     if (
         len(tokens) == 3
         and _kw(tokens[0]) in _NOW_NAMES
@@ -287,7 +260,7 @@ def _base_time_value(tokens: list[_Token]) -> _TimeValue | None:
         and tokens[2].kind == "op"
         and tokens[2].text == ")"
     ):
-        return _TimeValue(_now_us(), False, True)
+        return _TimeValue(_now_us(), False)
     cast = _cast_value(tokens)
     if cast is not None:
         return cast
@@ -321,7 +294,7 @@ def _cast_value(tokens: list[_Token]) -> _TimeValue | None:
                 and rest[2].text == ")"
             ):
                 if typ.startswith("TIMESTAMP") or typ == "DATE":
-                    return _parse_datetime(inner[0].text, typed=True)
+                    return _parse_datetime(inner[0].text)
     return None
 
 
@@ -340,112 +313,89 @@ def _to_timestamp_value(tokens: list[_Token]) -> _TimeValue | None:
             args = _split_commas(tokens[2:-1])
             if len(args) <= 2 and len(args[0]) == 1:
                 if args[0][0].kind == "string":
-                    return _parse_datetime(args[0][0].text, typed=True)
+                    return _parse_datetime(args[0][0].text)
     return None
-
-
-def _epoch_int(tokens: list[_Token]) -> int | None:
-    if len(tokens) == 1 and tokens[0].kind == "number":
-        if tokens[0].text.isdigit():
-            return int(tokens[0].text)
-    return None
-
-
-def _scale_epoch(value: int) -> int | None:
-    digits = len(str(value))
-    if digits == 10:
-        scaled = value * 1_000_000
-    elif digits == 13:
-        scaled = value * 1_000
-    elif digits == 16:
-        scaled = value
-    elif digits == 19:
-        scaled = value // 1_000
-    else:
-        return None
-    if _EPOCH_MIN_US <= scaled <= _EPOCH_MAX_US:
-        return scaled
-    return None
-
-
-def _timeish(tokens: list[_Token]) -> bool:
-    parts: list[str] = []
-    i = 0
-    while i < len(tokens):
-        if tokens[i].kind != "name":
-            return False
-        parts.append(tokens[i].text)
-        i += 1
-        if i < len(tokens):
-            if tokens[i].kind == "op" and tokens[i].text == ".":
-                i += 1
-            else:
-                return False
-    if not parts:
-        return False
-    name = parts[-1].lower()
-    return "time" in name or "date" in name or name in ("ts", "dttm", "day")
-
-
-def _time_operand(tokens: list[_Token]) -> bool:
-    # Whether the non-literal side of a comparison looks like time
-    # itself: a time-like column name, a call to a known time function,
-    # or a cast of a time-like column. Anything else, and a bare string
-    # beside it is just a string comparison.
-    if _timeish(tokens):
-        return True
-    if (
-        len(tokens) >= 4
-        and tokens[0].kind == "name"
-        and not tokens[0].quoted
-        and tokens[1].kind == "op"
-        and tokens[1].text == "("
-        and tokens[-1].kind == "op"
-        and tokens[-1].text == ")"
-    ):
-        name = tokens[0].text.lower()
-        if name in _TIME_FUNCTIONS or name.startswith("to_timestamp"):
-            return True
-        if name == "cast":
-            inner = tokens[2:-1]
-            depth = 0
-            for i, token in enumerate(inner):
-                if token.kind == "op":
-                    if token.text == "(":
-                        depth += 1
-                    elif token.text == ")":
-                        depth -= 1
-                    continue
-                if depth == 0 and _kw(token) == "AS":
-                    return _timeish(inner[:i])
-    return False
 
 
 def _epoch_value(tokens: list[_Token]) -> _TimeValue | None:
-    number = _epoch_int(tokens)
-    if number is None:
-        return None
-    scaled = _scale_epoch(number)
-    if scaled is None:
-        return None
-    return _TimeValue(scaled, False, True)
+    # _timestamp is microseconds, and only a 16-digit integer is one
+    # of those. Shorter ones are seconds or milliseconds, which the
+    # server compares against as they stand, far tighter than the
+    # writer meant, so they bound nothing.
+    if len(tokens) == 1 and tokens[0].kind == "number":
+        text = tokens[0].text
+        if len(text) == 16 and text.isdigit():
+            value = int(text)
+            if _EPOCH_MIN_US <= value <= _EPOCH_MAX_US:
+                return _TimeValue(value, False)
+    return None
 
 
-def _bounds(op: str, value: _TimeValue) -> tuple[int | None, int | None]:
-    # Bounds are inclusive below and exclusive above, like the filter
+def _is_timestamp_column(tokens: list[_Token]) -> bool:
+    # The window is on _timestamp, so only the column itself, bare or
+    # qualified with a table name, bounds it: a filter on any other
+    # column, time-like name or not, leaves _timestamp anywhere.
+    i = 0
+    while True:
+        if i >= len(tokens) or tokens[i].kind != "name":
+            return False
+        if i + 1 == len(tokens):
+            return tokens[i].text.lower() == "_timestamp"
+        if tokens[i + 1].kind != "op" or tokens[i + 1].text != ".":
+            return False
+        i += 2
+
+
+def _literal_value(tokens: list[_Token], side: str) -> _TimeValue | None:
+    value = _time_value(tokens, side)
+    if value is not None:
+        return value
+    return _epoch_value(tokens)
+
+
+def _comparison_bounds(
+    op: str, tokens: list[_Token]
+) -> tuple[int | None, int | None]:
+    # The window bounds of `_timestamp <op> value`. Bounds are
+    # inclusive below and exclusive above, like the filter
     # OpenObserve itself applies; a day-granular literal covers its
-    # whole day on the inclusive upper side.
-    end = value.us + (_DAY_US if value.date_only else 1)
+    # whole day on the upper side.
     if op == ">=":
+        value = _literal_value(tokens, "low")
+        if value is None:
+            return None, None
         return value.us, None
     if op == ">":
+        value = _literal_value(tokens, "low")
+        if value is None:
+            return None, None
         return value.us + 1, None
     if op == "<=":
-        return None, end
+        value = _literal_value(tokens, "high")
+        if value is None:
+            return None, None
+        return None, value.us + (_DAY_US if value.date_only else 1)
     if op == "<":
+        value = _literal_value(tokens, "high")
+        if value is None:
+            return None, None
         return None, value.us
     if op == "=":
-        return value.us, end
+        low = _literal_value(tokens, "low")
+        high = _literal_value(tokens, "high")
+        if low is None or high is None:
+            return None, None
+        return low.us, high.us + (_DAY_US if high.date_only else 1)
+    return None, None
+
+
+def _comparison(
+    lhs: list[_Token], op: str, rhs: list[_Token]
+) -> tuple[int | None, int | None]:
+    if _is_timestamp_column(lhs) and not _is_timestamp_column(rhs):
+        return _comparison_bounds(op, rhs)
+    if _is_timestamp_column(rhs) and not _is_timestamp_column(lhs):
+        return _comparison_bounds(_FLIP[op], lhs)
     return None, None
 
 
@@ -470,17 +420,6 @@ def _or_all(
     low = min(lows) if len(lows) == len(intervals) else None
     high = max(highs) if len(highs) == len(intervals) else None
     return low, high
-
-
-def _complement(
-    interval: tuple[int | None, int | None],
-) -> tuple[int | None, int | None]:
-    low, high = interval
-    if low is None:
-        return high, None
-    if high is None:
-        return None, low
-    return None, None
 
 
 def _split_commas(tokens: list[_Token]) -> list[list[_Token]]:
@@ -550,6 +489,11 @@ def _is_wrapped(tokens: list[_Token]) -> bool:
 def _parse_bool(tokens: list[_Token]) -> tuple[int | None, int | None]:
     if not tokens:
         return None, None
+    # The ANDs and ORs inside a CASE ... WHEN cannot be told from
+    # top-level ones, so a CASE anywhere in the clause leaves the
+    # range unresolved rather than half-split.
+    if any(_kw(token) == "CASE" for token in tokens):
+        return None, None
     or_parts = _split_keyword(tokens, "OR")
     if len(or_parts) > 1:
         return _or_all([_parse_bool(part) for part in or_parts])
@@ -574,11 +518,12 @@ def _parse_bool(tokens: list[_Token]) -> tuple[int | None, int | None]:
 
 
 def _negate(tokens: list[_Token]) -> tuple[int | None, int | None]:
-    # NOT distributes over the connective it negates, by De Morgan:
-    # NOT (a AND b) is NOT a OR NOT b, and NOT (a OR b) is NOT a
-    # AND NOT b. Complementing the combined window instead would
-    # narrow a mixed conjunction, whose other conjunct leaves the
-    # rows it still matches unbounded in time.
+    # NOT over a single comparison flips the operator: a bound
+    # widened to be safe is widened the wrong way round once
+    # negated, so the flipped bound is worked out from its own
+    # value. NOT over anything more — a conjunction, a disjunction,
+    # another NOT, a BETWEEN — stays wide: the rows the other
+    # predicates still match cannot be bounded.
     while (
         len(tokens) >= 2
         and tokens[0].kind == "op"
@@ -591,19 +536,26 @@ def _negate(tokens: list[_Token]) -> tuple[int | None, int | None]:
         if inner and _kw(inner[0]) == "SELECT":
             break
         tokens = inner
-    or_parts = _split_keyword(tokens, "OR")
-    if len(or_parts) > 1:
-        result: tuple[int | None, int | None] = (None, None)
-        for part in or_parts:
-            result = _and_intersect(result, _complement(_parse_bool(part)))
-        return result
-    and_parts = _split_keyword(tokens, "AND")
-    if len(and_parts) > 1:
-        return _or_all([_complement(_parse_bool(p)) for p in and_parts])
-    return _complement(_parse_bool(tokens))
+    if not tokens:
+        return None, None
+    if len(_split_keyword(tokens, "OR")) > 1:
+        return None, None
+    if len(_split_keyword(tokens, "AND")) > 1:
+        return None, None
+    if _kw(tokens[0]) == "NOT":
+        return None, None
+    comparison = _single_comparison(tokens)
+    if comparison is None:
+        return None, None
+    lhs, op, rhs = comparison
+    return _comparison(lhs, _INVERT[op], rhs)
 
 
-def _predicate(tokens: list[_Token]) -> tuple[int | None, int | None]:
+def _single_comparison(
+    tokens: list[_Token],
+) -> tuple[list[_Token], str, list[_Token]] | None:
+    # The one top-level comparison operator, if the tokens are a
+    # single comparison.
     cmp_at = -1
     depth = 0
     for i, token in enumerate(tokens):
@@ -614,53 +566,19 @@ def _predicate(tokens: list[_Token]) -> tuple[int | None, int | None]:
                 depth -= 1
             elif depth == 0 and token.text in _COMPARISONS:
                 if cmp_at >= 0:
-                    return None, None
+                    return None
                 cmp_at = i
-    if cmp_at >= 0:
-        return _comparison(
-            tokens[:cmp_at], tokens[cmp_at].text, tokens[cmp_at + 1 :]
-        )
-    return _set_predicate(tokens)
-
-
-def _comparison(
-    lhs: list[_Token], op: str, rhs: list[_Token]
-) -> tuple[int | None, int | None]:
-    # A typed timestamp bounds the range against anything it is
-    # compared with, but a bare string only against a time-like side,
-    # so that a string comparison on an ordinary column cannot narrow
-    # the range.
-    left = _time_value(lhs)
-    right = _time_value(rhs)
-    if left is not None and right is None:
-        if left.typed or _time_operand(rhs):
-            return _bounds(_FLIP[op], left)
-        return None, None
-    if right is not None and left is None:
-        if right.typed or _time_operand(lhs):
-            return _bounds(op, right)
-        return None, None
-    left_epoch = _epoch_value(lhs)
-    right_epoch = _epoch_value(rhs)
-    if left_epoch is not None and _timeish(rhs):
-        return _bounds(_FLIP[op], left_epoch)
-    if right_epoch is not None and _timeish(lhs):
-        return _bounds(op, right_epoch)
-    return None, None
-
-
-def _side_value(
-    tokens: list[_Token], operand: list[_Token]
-) -> _TimeValue | None:
-    value = _time_value(tokens)
-    if value is not None:
-        if value.typed or _time_operand(operand):
-            return value
+    if cmp_at < 0:
         return None
-    epoch = _epoch_value(tokens)
-    if epoch is not None and _timeish(operand):
-        return epoch
-    return None
+    return tokens[:cmp_at], tokens[cmp_at].text, tokens[cmp_at + 1 :]
+
+
+def _predicate(tokens: list[_Token]) -> tuple[int | None, int | None]:
+    comparison = _single_comparison(tokens)
+    if comparison is not None:
+        lhs, op, rhs = comparison
+        return _comparison(lhs, op, rhs)
+    return _set_predicate(tokens)
 
 
 def _set_predicate(tokens: list[_Token]) -> tuple[int | None, int | None]:
@@ -679,17 +597,24 @@ def _set_predicate(tokens: list[_Token]) -> tuple[int | None, int | None]:
             continue
         negated = i > 0 and _kw(tokens[i - 1]) == "NOT"
         operand = tokens[: i - 1 if negated else i]
+        if not _is_timestamp_column(operand):
+            return None, None
+        if negated:
+            # NOT IN and NOT BETWEEN match rows on either side of
+            # the span, and no single window covers both.
+            return None, None
         if keyword == "BETWEEN":
             parts = _split_keyword(tokens[i + 1 :], "AND")
             if len(parts) != 2:
                 return None, None
-            low = _side_value(parts[0], operand)
-            high = _side_value(parts[1], operand)
+            low = _literal_value(parts[0], "low")
+            high = _literal_value(parts[1], "high")
             if low is None or high is None:
                 return None, None
-            end = high.us + (_DAY_US if high.date_only else 1)
-            interval = (low.us, end)
-            return _complement(interval) if negated else interval
+            return (
+                low.us,
+                high.us + (_DAY_US if high.date_only else 1),
+            )
         group = tokens[i + 1 :]
         if (
             len(group) >= 2
@@ -699,56 +624,148 @@ def _set_predicate(tokens: list[_Token]) -> tuple[int | None, int | None]:
             and group[-1].text == ")"
             and _is_wrapped(group)
         ):
-            values: list[_TimeValue] = []
-            complete = True
+            lows: list[int] = []
+            highs: list[int] = []
             for item in _split_commas(group[1:-1]):
-                value = _side_value(item, operand)
-                if value is None:
-                    complete = False
-                    break
-                values.append(value)
-            if complete and values:
-                top = max(values, key=lambda item: item.us)
-                end = top.us + (_DAY_US if top.date_only else 1)
-                interval = (min(item.us for item in values), end)
-                return _complement(interval) if negated else interval
+                low = _literal_value(item, "low")
+                high = _literal_value(item, "high")
+                if low is None or high is None:
+                    return None, None
+                lows.append(low.us)
+                highs.append(high.us + (_DAY_US if high.date_only else 1))
+            if lows:
+                return min(lows), max(highs)
         return None, None
     return None, None
 
 
-def _where_ranges(tokens: list[_Token]) -> list[list[_Token]]:
-    ranges: list[list[_Token]] = []
+def _stops_clause(tokens: list[_Token], i: int) -> bool:
+    # Whether the keyword at tokens[i] starts a new clause. Every one
+    # of these words also parses as an unquoted column name on this
+    # server, so the word alone cannot be trusted to end a clause:
+    # only the shape of the clause that follows it can, and nothing
+    # a column produces matches that shape.
+    keyword = _kw(tokens[i])
+    nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+    if keyword in ("GROUP", "ORDER"):
+        return _kw(nxt) == "BY"
+    if keyword in ("LIMIT", "OFFSET"):
+        return nxt is not None and nxt.kind == "number"
+    if keyword == "WINDOW":
+        after = tokens[i + 2] if i + 2 < len(tokens) else None
+        return nxt is not None and nxt.kind == "name" and _kw(after) == "AS"
+    if keyword in _COMPOUND_OPS:
+        if _kw(nxt) == "SELECT":
+            return True
+        if _kw(nxt) in ("ALL", "DISTINCT"):
+            after = tokens[i + 2] if i + 2 < len(tokens) else None
+            return _kw(after) == "SELECT"
+        return False
+    return False
+
+
+def _branch_wheres(tokens: list[_Token]) -> list[list[_Token] | None]:
+    # One entry per top-level branch of the statement: the tokens of
+    # its WHERE clause, or None when it has none. A branch without a
+    # WHERE matches rows at any time, so the branches are combined
+    # with the widest window of them all — wide open when one has
+    # none. Branches are delimited by set operators and semicolons.
+    branches: list[list[_Token] | None] = []
     start: int | None = None
+    stop: int | None = None
     depth = 0
-    for i, token in enumerate(tokens):
+    i = 0
+    n = len(tokens)
+
+    def cut() -> None:
+        nonlocal start, stop
+        if start is None:
+            branches.append(None)
+        elif stop is None:
+            branches.append(tokens[start:])
+        else:
+            branches.append(tokens[start:stop])
+        start = None
+        stop = None
+
+    while i < n:
+        token = tokens[i]
         if token.kind == "op":
             if token.text == "(":
                 depth += 1
             elif token.text == ")":
                 depth -= 1
             elif token.text == ";" and depth == 0:
-                if start is not None:
-                    ranges.append(tokens[start:i])
-                    start = None
-            continue
-        if depth != 0:
+                if start is not None and stop is None:
+                    stop = i
+                cut()
+            i += 1
             continue
         keyword = _kw(token)
-        if start is not None:
-            if keyword in _CLAUSE_STOPS:
-                ranges.append(tokens[start:i])
-                start = None
-        elif keyword == "WHERE":
+        if depth == 0 and _stops_clause(tokens, i):
+            if start is not None and stop is None:
+                stop = i
+            if keyword in _COMPOUND_OPS:
+                cut()
+            i += 1
+            continue
+        if (
+            depth == 0
+            and keyword == "WHERE"
+            and start is None
+            and stop is None
+        ):
             start = i + 1
-    if start is not None:
-        ranges.append(tokens[start:])
-    return ranges
+        i += 1
+    cut()
+    return branches
+
+
+def _second_stream(tokens: list[_Token]) -> bool:
+    # OpenObserve applies the window to every stream in the query,
+    # not only to the one whose _timestamp is filtered, so a query
+    # that reads a second stream cannot be narrowed: the other
+    # stream's rows can lie anywhere. A JOIN, a comma between
+    # tables and a subquery of its own all read one.
+    depth = 0
+    from_depth: int | None = None
+    for i, token in enumerate(tokens):
+        if token.kind == "op":
+            if token.text == "(":
+                depth += 1
+            elif token.text == ")":
+                depth -= 1
+                if from_depth is not None and depth < from_depth:
+                    from_depth = None
+            elif token.text == "," and from_depth == depth:
+                return True
+            elif token.text == ";" and depth == 0:
+                from_depth = None
+            continue
+        keyword = _kw(token)
+        if keyword == "JOIN":
+            return True
+        if keyword == "FROM":
+            if depth >= 1:
+                return True
+            if from_depth is None:
+                from_depth = depth
+            continue
+        if from_depth == depth and (
+            keyword == "WHERE" or _stops_clause(tokens, i)
+        ):
+            from_depth = None
+    return False
 
 
 def _analyze(sql: str) -> tuple[int | None, int | None]:
     try:
+        tokens = _tokenize(sql)
+        if _second_stream(tokens):
+            return None, None
         intervals = [
-            _parse_bool(where) for where in _where_ranges(_tokenize(sql))
+            _parse_bool(where) if where is not None else (None, None)
+            for where in _branch_wheres(tokens)
         ]
     except Exception:
         # Unparseable SQL falls back to the widest range, which is
@@ -762,46 +779,64 @@ def extract_time_range(sql: str) -> tuple[int, int]:
     Return the (start, end) time range to send with a query, in
     microseconds since the epoch.
 
-    OpenObserve needs these outside the SQL on every search, and applies
-    them itself as ``_timestamp >= start AND _timestamp < end``, on top
-    of the SQL. The range therefore only has to cover the rows the SQL
-    can match: wider is always safe, narrower loses rows.
+    OpenObserve needs these outside the SQL on every search, and
+    applies them itself as ``_timestamp >= start AND _timestamp <
+    end``, on top of the SQL and to every stream in it. The range
+    therefore only has to cover the rows the SQL can match: wider is
+    always safe, narrower loses rows.
 
-    Start and end are worked out from the time comparisons in the
-    statement's WHERE clause, with AND keeping the narrowest window, OR
-    the widest, and NOT distributing over the connective it negates,
-    De Morgan style, so a negated time filter cannot cut off rows that
-    still match through another predicate. A comparison that cannot
-    be resolved leaves that side of the range open: start falls back
-    to just after the epoch (the API rejects zero) and end to now plus
-    an hour, or to the far future when the start itself lies in the
-    future, since no horizon based on now covers the rows it matches.
+    Only a comparison on _timestamp itself narrows the range: the
+    window is on _timestamp, and a comparison on any other column,
+    time-like name or not, says nothing about it — nor does one on a
+    function of it, like date_trunc or histogram, which rounds or
+    moves the timestamps it compares. A query that reads a second
+    stream — a JOIN, a comma between tables, a subquery — cannot be
+    narrowed either: the window reaches every stream in the query,
+    not only the filtered one, and the other stream's rows can lie
+    anywhere. Nor can one whose WHERE holds a CASE, whose inner ANDs
+    and ORs cannot be told from top-level ones. Of the branches a
+    set operator combines, each WHERE yields a window and the widest
+    of them covers the lot — wide open when a branch has no WHERE.
 
-    A timestamp is any ISO 8601 literal string, with or without CAST,
-    to_timestamp or TIMESTAMP/DATE typing, and ``now()`` plus or minus
-    an INTERVAL. A typed timestamp bounds the range against whatever it
-    is compared with, but a bare string only against a column with a
-    time-like name or a time function of one, so that a string
-    comparison on an ordinary column cannot narrow the range. A
-    date-only literal, like '2024-01-01', covers its whole day on the
-    inclusive upper side. A bare integer is read as an epoch in
-    seconds, milliseconds, microseconds or nanoseconds by its digit
-    count, again only against a time-like column name.
+    Within a branch, AND keeps the narrowest window of its
+    conjuncts, OR the widest of its disjuncts, and NOT flips the one
+    comparison it negates, worked out from the value again so that
+    the day a day-granular inclusive bound covers is not carried
+    through the flip: NOT (_timestamp <= '2024-01-01') starts just
+    after midnight, not after the whole day. NOT over anything more
+    than a single comparison leaves the range wide: the rows the
+    other predicates still match cannot be bounded.
+
+    A comparison that cannot be resolved leaves that side of the
+    range open: start falls back to just after the epoch (the API
+    rejects zero), and end to now plus the 24 hours OpenObserve
+    ingests stamped ahead of it, with slack for clock skew, or to
+    the far future when the start itself lies ahead of now, since
+    no horizon based on now covers the rows it matches.
+
+    A timestamp value is any ISO 8601 literal string, with or without
+    TIMESTAMP or DATE typing, CAST, to_timestamp, or now() plus or
+    minus an INTERVAL; the shortest month and year go into a lower
+    bound and the longest into an upper one. A bare integer is an
+    epoch only as 16-digit microseconds, the width of _timestamp
+    itself: shorter ones are seconds or milliseconds, compared as
+    they stand and far tighter than the writer meant, so they bound
+    nothing.
     """
     low, high = _analyze(sql)
     if low is None or low < 1:
         low = 1
     if high is None:
         now = _now_us()
-        high = now + _MARGIN_US
+        high = now + _FUTURE_MARGIN_US
         if low > now:
-            # A lower bound in the future matches rows that no
+            # A lower bound ahead of now matches rows that no
             # horizon based on now can cover: the end goes to the
             # far future instead of collapsing onto the start.
             high = max(low + 1, _EPOCH_MAX_US)
     elif high <= low:
-        # Both bounds resolved with the end at or before the
-        # start: the SQL cannot match anything, so any window is
-        # safe, and the smallest one keeps the search cheap.
+        # Both bounds resolved with the end at or before the start:
+        # the SQL cannot match anything, so any window is safe, and
+        # the smallest one keeps the search cheap.
         high = low + 1
     return low, high
