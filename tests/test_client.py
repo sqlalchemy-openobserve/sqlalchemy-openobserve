@@ -28,7 +28,7 @@ def test_search_posts_query_with_basic_auth(
 ) -> None:
     session.request.return_value.json.return_value = {
         "columns": ["level"],
-        "hits": [{"level": "info"}],
+        "hits": [["info"]],
         "is_partial": True,
         "total": 1,
     }
@@ -37,7 +37,7 @@ def test_search_posts_query_with_basic_auth(
 
     assert result == {
         "columns": ["level"],
-        "rows": [{"level": "info"}],
+        "rows": [["info"]],
         "is_partial": True,
     }
     assert session.auth == ("user", "pass")
@@ -58,13 +58,38 @@ def test_search_posts_query_with_basic_auth(
     )
 
 
-def test_search_raises_query_error_for_http_200_error(
+def test_search_raises_query_error_with_http_400_message(
     session: Mock, client: OpenObserveClient
 ) -> None:
-    session.request.return_value.json.return_value = {"error": "invalid SQL"}
+    response = Mock()
+    response.status_code = 400
+    response.json.return_value = {
+        "code": 400,
+        "message": "invalid SQL syntax",
+    }
+    response.raise_for_status.side_effect = requests.HTTPError(
+        "400 Bad Request", response=response
+    )
+    session.request.return_value = response
 
-    with pytest.raises(QueryError, match="invalid SQL"):
+    with pytest.raises(QueryError, match="invalid SQL syntax"):
         client.search("select * from", 10, 20)
+
+
+def test_search_does_not_decode_plain_text_401_body(
+    session: Mock, client: OpenObserveClient
+) -> None:
+    response = Mock()
+    response.status_code = 401
+    response.raise_for_status.side_effect = requests.HTTPError(
+        "401 Unauthorized", response=response
+    )
+    session.request.return_value = response
+
+    with pytest.raises(OpenObserveError, match="401 Unauthorized"):
+        client.search("select * from logs", 10, 20)
+
+    response.json.assert_not_called()
 
 
 def test_list_streams_returns_stream_names(
@@ -210,6 +235,22 @@ def test_ssl_can_be_disabled(session: Mock) -> None:
         session.request.call_args.args[1]
         == "http://localhost:5080/api/default/_search"
     )
+
+
+@pytest.mark.parametrize("verify", [False, "C:/certs/openobserve-ca.pem"])
+def test_tls_verification_can_be_configured(
+    session: Mock, verify: bool | str
+) -> None:
+    OpenObserveClient(
+        "observe.example",
+        5080,
+        "default",
+        "user",
+        "pass",
+        verify=verify,
+    )
+
+    assert session.verify == verify
 
 
 def test_close_closes_http_session(session: Mock) -> None:

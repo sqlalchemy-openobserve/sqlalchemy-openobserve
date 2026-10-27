@@ -29,12 +29,11 @@ class OpenObserveClient:
         email: str,
         password: str,
         ssl: bool = True,
+        verify: bool | str = True,
     ) -> None:
         self.host = host
         self.port = port
         self.organization = organization
-        self.email = email
-        self.password = password
         scheme = "https" if ssl else "http"
         url_host = (
             f"[{host}]" if ":" in host and not host.startswith("[") else host
@@ -43,8 +42,15 @@ class OpenObserveClient:
         self._session = requests.Session()
         self._session.auth = (email, password)
         self._session.headers.update({"Accept": "application/json"})
+        self._session.verify = verify
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        query_error_on_400: bool = False,
+        **kwargs: Any,
+    ) -> Any:
         url = (
             f"{self._base_url}/api/{quote(self.organization, safe='')}/{path}"
         )
@@ -54,6 +60,24 @@ class OpenObserveClient:
             )
             response.raise_for_status()
             return response.json()
+        except requests.HTTPError as exc:
+            error_response = exc.response
+            if (
+                query_error_on_400
+                and error_response is not None
+                and error_response.status_code == 400
+            ):
+                try:
+                    body = error_response.json()
+                except requests.exceptions.JSONDecodeError:
+                    body = None
+                if isinstance(body, dict) and isinstance(
+                    body.get("message"), str
+                ):
+                    raise QueryError(body["message"]) from exc
+            raise OpenObserveError(
+                f"OpenObserve {method} request to {path} failed: {exc}"
+            ) from exc
         except requests.RequestException as exc:
             raise OpenObserveError(
                 f"OpenObserve {method} request to {path} failed: {exc}"
@@ -62,10 +86,15 @@ class OpenObserveClient:
     def search(
         self, sql: str, start_time: int, end_time: int, size: int = 1000
     ) -> dict[str, Any]:
-        """Run a query. Times are microseconds since the epoch."""
+        """Run a query. Times are microseconds since the epoch.
+
+        Use SQL LIMIT/OFFSET to page through results; the API's size can cap
+        returned hits without marking the response as partial.
+        """
         result = self._request(
             "POST",
             "_search",
+            query_error_on_400=True,
             json={
                 "query": {
                     "sql": sql,
@@ -73,6 +102,8 @@ class OpenObserveClient:
                     "end_time": end_time,
                     "from": 0,
                     "size": size,
+                    # Table mode returns hits as row arrays with columns.
+                    # OpenObserve can prepend _timestamp to those columns.
                     "query_type": "table",
                 }
             },
@@ -81,8 +112,6 @@ class OpenObserveClient:
             raise OpenObserveError(
                 "OpenObserve search response must be an object"
             )
-        if "error" in result:
-            raise QueryError(str(result["error"]))
         return {
             "columns": result.get("columns", []),
             "rows": result.get("hits", result.get("rows", [])),
