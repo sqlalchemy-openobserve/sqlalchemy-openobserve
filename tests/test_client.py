@@ -45,6 +45,7 @@ def test_search_posts_query_with_basic_auth(
         "POST",
         "https://observe.example:5080/api/my%20org/_search",
         timeout=30,
+        verify=True,
         json={
             "query": {
                 "sql": "select * from logs",
@@ -92,6 +93,34 @@ def test_search_does_not_decode_plain_text_401_body(
     response.json.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "body, json_error",
+    [
+        (None, requests.exceptions.JSONDecodeError("invalid json", "", 0)),
+        ({"code": 400, "message": 123}, None),
+        ({"code": 400}, None),
+    ],
+)
+def test_search_uses_http_error_for_invalid_400_body(
+    session: Mock,
+    client: OpenObserveClient,
+    body: object,
+    json_error: Exception | None,
+) -> None:
+    response = Mock()
+    response.status_code = 400
+    response.json.return_value = body
+    if json_error is not None:
+        response.json.side_effect = json_error
+    response.raise_for_status.side_effect = requests.HTTPError(
+        "400 Bad Request", response=response
+    )
+    session.request.return_value = response
+
+    with pytest.raises(OpenObserveError, match="400 Bad Request"):
+        client.search("select * from", 10, 20)
+
+
 def test_list_streams_returns_stream_names(
     session: Mock, client: OpenObserveClient
 ) -> None:
@@ -105,6 +134,7 @@ def test_list_streams_returns_stream_names(
         "GET",
         "https://observe.example:5080/api/my%20org/streams",
         timeout=30,
+        verify=True,
         params={"type": "logs"},
     )
 
@@ -123,6 +153,7 @@ def test_list_streams_accepts_stream_type(
         "GET",
         "https://observe.example:5080/api/my%20org/streams",
         timeout=30,
+        verify=True,
         params={"type": "metrics"},
     )
 
@@ -146,6 +177,7 @@ def test_stream_schema_quotes_stream_name(
         "GET",
         "https://observe.example:5080/api/my%20org/streams/app%2Flogs/schema",
         timeout=30,
+        verify=True,
         params={"type": "logs"},
     )
 
@@ -165,6 +197,7 @@ def test_stream_schema_accepts_stream_type(
         "GET",
         "https://observe.example:5080/api/my%20org/streams/cpu/schema",
         timeout=30,
+        verify=True,
         params={"type": "traces"},
     )
 
@@ -237,11 +270,11 @@ def test_ssl_can_be_disabled(session: Mock) -> None:
     )
 
 
-@pytest.mark.parametrize("verify", [False, "C:/certs/openobserve-ca.pem"])
+@pytest.mark.parametrize("verify", [False, "/certs/openobserve-ca.pem"])
 def test_tls_verification_can_be_configured(
     session: Mock, verify: bool | str
 ) -> None:
-    OpenObserveClient(
+    client = OpenObserveClient(
         "observe.example",
         5080,
         "default",
@@ -249,8 +282,25 @@ def test_tls_verification_can_be_configured(
         "pass",
         verify=verify,
     )
+    session.request.return_value.json.return_value = {}
 
-    assert session.verify == verify
+    client.search("select 1", 1, 2)
+
+    assert session.request.call_args.kwargs["verify"] == verify
+
+
+def test_invalid_ca_path_is_reported_as_client_error(
+    session: Mock, client: OpenObserveClient
+) -> None:
+    error = OSError("Could not find a suitable TLS CA certificate bundle")
+    session.request.side_effect = error
+
+    with pytest.raises(
+        OpenObserveError, match="TLS CA certificate bundle"
+    ) as exc:
+        client.search("select 1", 1, 2)
+
+    assert exc.value.__cause__ is error
 
 
 def test_close_closes_http_session(session: Mock) -> None:

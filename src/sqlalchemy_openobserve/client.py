@@ -39,10 +39,10 @@ class OpenObserveClient:
             f"[{host}]" if ":" in host and not host.startswith("[") else host
         )
         self._base_url = f"{scheme}://{url_host}:{port}"
+        self._verify = verify
         self._session = requests.Session()
         self._session.auth = (email, password)
         self._session.headers.update({"Accept": "application/json"})
-        self._session.verify = verify
 
     def _request(
         self,
@@ -56,7 +56,11 @@ class OpenObserveClient:
         )
         try:
             response = self._session.request(
-                method, url, timeout=self._timeout, **kwargs
+                method,
+                url,
+                timeout=self._timeout,
+                verify=self._verify,
+                **kwargs,
             )
             response.raise_for_status()
             return response.json()
@@ -79,6 +83,10 @@ class OpenObserveClient:
                 f"OpenObserve {method} request to {path} failed: {exc}"
             ) from exc
         except requests.RequestException as exc:
+            raise OpenObserveError(
+                f"OpenObserve {method} request to {path} failed: {exc}"
+            ) from exc
+        except OSError as exc:
             raise OpenObserveError(
                 f"OpenObserve {method} request to {path} failed: {exc}"
             ) from exc
