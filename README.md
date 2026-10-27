@@ -9,6 +9,8 @@ built so that Apache Superset can connect to it.
 
 OpenObserve is queried with SQL over an HTTP API. This package exposes it to
 SQLAlchemy so tools built on SQLAlchemy can read from it. It is read-only.
+The client checks connectivity by listing streams; a `SELECT 1` probe is not
+valid because OpenObserve queries must reference a stream.
 
 The Superset side (the DB engine spec) will live in the Apache Superset
 repository, not here.
