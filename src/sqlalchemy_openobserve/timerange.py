@@ -191,14 +191,11 @@ def _tokenize(sql: str) -> list[_Token]:
             i = n if j < 0 else j + 2
         elif ch.isdigit():
             j = i
-            while (
-                j < n
-                and (
-                    sql[j].isdigit()
-                    or sql[j] == "."
-                    or sql[j] in "eE"
-                    or (sql[j] in "+-" and sql[j - 1] in "eE")
-                )
+            while j < n and (
+                sql[j].isdigit()
+                or sql[j] == "."
+                or sql[j] in "eE"
+                or (sql[j] in "+-" and sql[j - 1] in "eE")
             ):
                 j += 1
             tokens.append(_Token("number", sql[i:j]))
@@ -505,9 +502,7 @@ def _split_commas(tokens: list[_Token]) -> list[list[_Token]]:
     return parts
 
 
-def _split_keyword(
-    tokens: list[_Token], keyword: str
-) -> list[list[_Token]]:
+def _split_keyword(tokens: list[_Token], keyword: str) -> list[list[_Token]]:
     # An AND directly after BETWEEN belongs to BETWEEN, not to the
     # boolean expression.
     parts: list[list[_Token]] = []

@@ -32,7 +32,13 @@ def us(
 ) -> int:
     return to_us(
         datetime(
-            year, month, day, hour, minute, second, microsecond,
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            microsecond,
             tzinfo=timezone.utc,
         )
     )
@@ -150,20 +156,14 @@ def test_not_between_is_wide() -> None:
 def test_not_mixed_conjunction_stays_wide() -> None:
     # NOT (ts >= a AND region = 'us') still matches rows at any ts
     # through region != 'us'
-    sql = (
-        "SELECT * FROM t WHERE NOT (ts >= '2024-01-01' "
-        "AND region = 'us')"
-    )
+    sql = "SELECT * FROM t WHERE NOT (ts >= '2024-01-01' AND region = 'us')"
     low, high = extract_time_range(sql)
     assert low == 1
     assert high >= now_us()
 
 
 def test_not_mixed_conjunction_wrapped_stays_wide() -> None:
-    sql = (
-        "SELECT * FROM t WHERE NOT "
-        "((ts >= '2024-01-01' AND region = 'us'))"
-    )
+    sql = "SELECT * FROM t WHERE NOT ((ts >= '2024-01-01' AND region = 'us'))"
     low, high = extract_time_range(sql)
     assert low == 1
     assert high >= now_us()
@@ -172,8 +172,7 @@ def test_not_mixed_conjunction_wrapped_stays_wide() -> None:
 def test_not_both_time_bounds_stays_wide() -> None:
     # Rows outside the window can lie on either side of it
     sql = (
-        "SELECT * FROM t WHERE NOT "
-        "(ts >= '2024-01-01' AND ts < '2024-02-01')"
+        "SELECT * FROM t WHERE NOT (ts >= '2024-01-01' AND ts < '2024-02-01')"
     )
     low, high = extract_time_range(sql)
     assert low == 1
@@ -183,8 +182,7 @@ def test_not_both_time_bounds_stays_wide() -> None:
 def test_not_distributes_over_and() -> None:
     # NOT (ts >= a AND ts >= b) == ts < a OR ts < b == ts < max(a, b)
     sql = (
-        "SELECT * FROM t WHERE NOT (ts >= '2024-01-01' "
-        "AND ts >= '2024-02-01')"
+        "SELECT * FROM t WHERE NOT (ts >= '2024-01-01' AND ts >= '2024-02-01')"
     )
     low, high = extract_time_range(sql)
     assert low == 1
@@ -193,20 +191,14 @@ def test_not_distributes_over_and() -> None:
 
 def test_not_distributes_over_or() -> None:
     # NOT (ts < a OR ts >= b) == ts >= a AND ts < b
-    sql = (
-        "SELECT * FROM t WHERE NOT (ts < '2024-01-01' "
-        "OR ts >= '2024-02-01')"
-    )
+    sql = "SELECT * FROM t WHERE NOT (ts < '2024-01-01' OR ts >= '2024-02-01')"
     assert extract_time_range(sql) == (us(2024, 1, 1), us(2024, 2, 1))
 
 
 def test_not_mixed_disjunction_bounds_other_side() -> None:
     # NOT (ts >= a OR region = 'us') == ts < a AND region != 'us':
     # every row the SQL matches has ts < a
-    sql = (
-        "SELECT * FROM t WHERE NOT (ts >= '2024-01-01' "
-        "OR region = 'us')"
-    )
+    sql = "SELECT * FROM t WHERE NOT (ts >= '2024-01-01' OR region = 'us')"
     low, high = extract_time_range(sql)
     assert low == 1
     assert high == us(2024, 1, 1)
@@ -268,10 +260,7 @@ def test_future_lower_bound_epoch_stays_open() -> None:
 
 
 def test_future_bounds_resolved_is_exact() -> None:
-    sql = (
-        "SELECT * FROM t WHERE ts >= '2030-01-01' "
-        "AND ts < '2031-01-01'"
-    )
+    sql = "SELECT * FROM t WHERE ts >= '2030-01-01' AND ts < '2031-01-01'"
     assert extract_time_range(sql) == (us(2030, 1, 1), us(2031, 1, 1))
 
 
@@ -363,9 +352,7 @@ def test_epoch_digit_scales() -> None:
 
 
 def test_epoch_needs_time_like_column() -> None:
-    low, _ = extract_time_range(
-        "SELECT * FROM t WHERE id >= 1704067200000000"
-    )
+    low, _ = extract_time_range("SELECT * FROM t WHERE id >= 1704067200000000")
     assert low == 1
 
 
@@ -490,10 +477,7 @@ def test_never_raises() -> None:
 
 
 def test_lowercase_keywords() -> None:
-    sql = (
-        "select * from t where ts >= '2024-01-01' "
-        "and ts < '2024-02-01'"
-    )
+    sql = "select * from t where ts >= '2024-01-01' and ts < '2024-02-01'"
     assert extract_time_range(sql) == (us(2024, 1, 1), us(2024, 2, 1))
 
 
