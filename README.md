@@ -32,6 +32,13 @@ openobserve://{email}:{password}@{host}:{port}/{organization}
 
 Python 3.11 or newer, SQLAlchemy 2.0.52 or newer in the 2.0 series.
 
+## Superset compatibility
+
+This package targets Apache Superset 7 and has not yet been tested with it.
+Superset 6.x and earlier are not supported: they pin SQLAlchemy below 2.0, and
+this package needs SQLAlchemy 2.0.52 or newer, so pip cannot install the two
+together.
+
 ## Development
 
 ```bash
