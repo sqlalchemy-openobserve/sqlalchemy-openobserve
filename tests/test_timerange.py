@@ -1,10 +1,16 @@
 """Tests for working out a query's time range"""
 
+import base64
+import calendar
+import json
 import random
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from operator import eq, ge, gt, le, lt, ne
 from typing import Any, Callable
 
+import pytest
 import sqlalchemy as sa
 from sqlalchemy import create_engine
 
@@ -351,10 +357,35 @@ def test_cast_forms() -> None:
     assert high == us(2024, 1, 1)
 
 
+def test_cast_to_date_lands_on_midnight() -> None:
+    # A cast to DATE gives midnight, not the time in the string:
+    # bound from 12:00, Jan 1 00:00 to 12:00 would be lost
+    sql = (
+        "SELECT * FROM t WHERE _timestamp >= "
+        "CAST('2024-01-01 12:00:00' AS DATE)"
+    )
+    low, _ = extract_time_range(sql)
+    assert low == us(2024, 1, 1)
+    # The day-granular value covers its whole day on the upper side
+    sql = (
+        "SELECT * FROM t WHERE _timestamp <= "
+        "CAST('2024-01-01 12:00:00' AS DATE)"
+    )
+    _, high = extract_time_range(sql)
+    assert high == us(2024, 1, 2)
+
+
+def test_date_typed_literal_lands_on_midnight() -> None:
+    sql = "SELECT * FROM t WHERE _timestamp > DATE '2024-01-01 12:00:00'"
+    low, _ = extract_time_range(sql)
+    assert low == us(2024, 1, 1) + 1
+
+
 def test_typed_literal() -> None:
     # v1.0.4 rejects this shape server-side (Int64 >= Timestamp);
     # kept so the parser keeps up with a server that types
-    # _timestamp as a timestamp.
+    # _timestamp as a timestamp. The claim is checked against the
+    # server by test_typed_literal_against_real_server below.
     low, _ = extract_time_range(
         "SELECT * FROM t WHERE _timestamp >= TIMESTAMP '2024-01-01'"
     )
@@ -367,11 +398,105 @@ def test_to_timestamp_forms() -> None:
         "to_timestamp('2024-01-01T00:00:00Z')"
     )
     assert low == us(2024, 1, 1)
+    # The string is read through the format argument, not as ISO
+    # 8601, so a format leaves the value unresolved
     low, _ = extract_time_range(
         "SELECT * FROM t WHERE _timestamp >= "
         "to_timestamp('2024-01-01', '%Y-%m-%d')"
     )
+    assert low == 1
+
+
+def test_fraction_rounds_up_on_the_high_side() -> None:
+    # Python keeps 6 fractional digits: an upper bound truncated
+    # onto '.000000' would cut off a row stamped in between
+    sql = "SELECT * FROM t WHERE _timestamp < '2024-01-01 00:00:00.0000001'"
+    _, high = extract_time_range(sql)
+    assert high == us(2024, 1, 1) + 1
+
+
+def test_fraction_truncates_on_the_low_side() -> None:
+    sql = "SELECT * FROM t WHERE _timestamp >= '2024-01-01 00:00:00.0000001'"
+    low, _ = extract_time_range(sql)
     assert low == us(2024, 1, 1)
+
+
+def test_sub_microsecond_equality_window() -> None:
+    sql = "SELECT * FROM t WHERE _timestamp = '2024-01-01 00:00:00.1234567'"
+    low, high = extract_time_range(sql)
+    value = us(2024, 1, 1, microsecond=123456)
+    # The instant lies between value and value + 1µs: the low side
+    # truncates onto value, the high one rounds up onto value + 1µs
+    # and adds its exclusive µs
+    assert low == value
+    assert high == value + 2
+
+
+# The local OpenObserve of docker-compose.yml, for the claims the
+# tests above make about what the server runs.
+
+
+BASE_URL = "http://localhost:5080"
+ORGANIZATION = "default"
+EMAIL = "root@example.com"
+PASSWORD = "Complexpass#123"
+
+
+def _server_up() -> bool:
+    try:
+        with urllib.request.urlopen(f"{BASE_URL}/healthz", timeout=1):
+            return True
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def _search(sql: str, start_time: int, end_time: int) -> dict[str, Any]:
+    credentials = base64.b64encode(f"{EMAIL}:{PASSWORD}".encode()).decode()
+    request = urllib.request.Request(
+        f"{BASE_URL}/api/{ORGANIZATION}/_search",
+        data=json.dumps(
+            {
+                "query": {
+                    "sql": sql,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "from": 0,
+                    "size": 1,
+                }
+            }
+        ).encode(),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Basic {credentials}",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.loads(response.read().decode())
+
+
+def test_typed_literal_against_real_server() -> None:
+    # test_typed_literal's comment claims the server rejects a
+    # TIMESTAMP literal against _timestamp (Int64 >= Timestamp);
+    # this checks the claim against the real server, with the
+    # window the module itself would send, whenever the local one
+    # from docker-compose.yml is up — so the comment cannot drift
+    # away from what the server runs.
+    if not _server_up():
+        pytest.skip(
+            "OpenObserve is not running; start it with: docker compose up -d"
+        )
+    sql = "SELECT count(*) AS c FROM app_logs"
+    low, high = extract_time_range(sql)
+    assert _search(sql, low, high)["hits"][0]["c"] > 0
+    sql = (
+        "SELECT count(*) AS c FROM app_logs "
+        "WHERE _timestamp >= TIMESTAMP '2024-01-01'"
+    )
+    low, high = extract_time_range(sql)
+    with pytest.raises(urllib.error.HTTPError) as error:
+        _search(sql, low, high)
+    assert "Cannot infer common argument type" in error.value.read().decode()
 
 
 def test_now_minus_interval() -> None:
@@ -453,6 +578,40 @@ def test_multi_part_interval() -> None:
     )
     after = now_us()
     assert before - 26 * HOUR <= low <= after - 26 * HOUR
+
+
+def test_signed_interval_bounds_nothing() -> None:
+    # A sign silently drops out of the pairs and flips the bound:
+    # '+ INTERVAL -1 day' would read as +1 day and lose the last
+    # 24h of rows
+    sql = "SELECT * FROM t WHERE _timestamp >= now() + INTERVAL '-1 day'"
+    low, _ = extract_time_range(sql)
+    assert low == 1
+
+
+def test_interval_with_clock_time_bounds_nothing() -> None:
+    # '1 day 12:00:00' would read as 1 day and lose 12 hours
+    sql = (
+        "SELECT * FROM t WHERE _timestamp >= now() - INTERVAL '1 day 12:00:00'"
+    )
+    low, _ = extract_time_range(sql)
+    assert low == 1
+
+
+def test_second_interval_with_sign_bounds_nothing() -> None:
+    # INTERVAL '1 day' + INTERVAL '-3 hours' would lose the 3h gap
+    sql = (
+        "SELECT * FROM t WHERE _timestamp < "
+        "'2024-01-01' + INTERVAL '1 day' + INTERVAL '-3 hours'"
+    )
+    _, high = extract_time_range(sql)
+    assert high >= now_us()
+
+
+def test_ago_interval_bounds_nothing() -> None:
+    sql = "SELECT * FROM t WHERE _timestamp >= now() - INTERVAL '1 day ago'"
+    low, _ = extract_time_range(sql)
+    assert low == 1
 
 
 def test_epoch_digit_scales() -> None:
@@ -760,6 +919,50 @@ def test_clause_after_where_is_cut() -> None:
     assert low == us(2024, 1, 1)
 
 
+def test_trailing_semicolon_keeps_the_window() -> None:
+    # A trailing `;` would cut an empty branch, which counts as one
+    # without a WHERE and opens the window wide
+    sql = (
+        "SELECT * FROM t WHERE _timestamp >= '2024-01-01' "
+        "AND _timestamp < '2024-02-01';"
+    )
+    assert extract_time_range(sql) == (us(2024, 1, 1), us(2024, 2, 1))
+
+
+def test_limit_forms_end_the_where() -> None:
+    # LIMIT %s, LIMIT ALL, LIMIT (5) and a trailing LIMIT — the
+    # placeholder of LIMIT %(limit)s, dropped by the tokenizer —
+    # end the WHERE as surely as LIMIT 5 does, so a limit the
+    # client passes as a parameter costs no bounds
+    for tail in ("LIMIT %s", "LIMIT ALL", "LIMIT (5)", "LIMIT %(limit)s"):
+        sql = (
+            "SELECT * FROM t WHERE _timestamp >= '2024-01-01' "
+            f"AND _timestamp < '2024-02-01' {tail}"
+        )
+        window = extract_time_range(sql)
+        assert window == (us(2024, 1, 1), us(2024, 2, 1)), tail
+
+
+def test_limit_parameter_before_offset_ends_the_where() -> None:
+    sql = (
+        "SELECT * FROM t WHERE _timestamp >= '2024-01-01' "
+        "AND _timestamp < '2024-02-01' LIMIT %s OFFSET 10"
+    )
+    assert extract_time_range(sql) == (us(2024, 1, 1), us(2024, 2, 1))
+
+
+def test_modulo_on_a_column_named_limit_is_not_cut() -> None:
+    # The same shape as LIMIT %s, but an arithmetic use of the word:
+    # the OR branch still bounds the window, so cutting at `limit`
+    # would narrow onto the time filter and lose its rows
+    sql = (
+        "SELECT * FROM t WHERE _timestamp >= '2024-01-01' "
+        "AND limit % 2 = 0 OR level = 'b'"
+    )
+    low, _ = extract_time_range(sql)
+    assert low == 1
+
+
 def test_window_clause_after_where_is_cut() -> None:
     sql = (
         "SELECT level, row_number() OVER w AS rn FROM t "
@@ -935,6 +1138,16 @@ def test_non_time_column_stricter_than_time_filter_is_ignored() -> None:
 # matches: the hand-written cases above cannot cover the nesting.
 
 
+def _add_months(value: datetime, count: int) -> datetime:
+    # A month of its calendar length, not the 28 or 31 days the
+    # parser widens with
+    month = value.month - 1 + count
+    year = value.year + month // 12
+    month = month % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
 def _literals() -> list[tuple[str, int]]:
     # (sql literal, the µs it means)
     lits: list[tuple[str, int]] = [
@@ -943,10 +1156,34 @@ def _literals() -> list[tuple[str, int]]:
     ]
     for day in range(1, 28, 3):
         date = f"2024-01-{day:02d}"
-        lits.append((f"'{date}'", us(2024, 1, day)))
-        lits.append((f"'{date}T12:00:00Z'", us(2024, 1, day, 12)))
+        stamp = f"{date}T12:00:00Z"
+        midnight = us(2024, 1, day)
+        noon = us(2024, 1, day, 12)
+        lits.append((f"'{date}'", midnight))
+        lits.append((f"'{stamp}'", noon))
+        # Typed and CAST values, a DATE-typed one landing on
+        # midnight whatever the time in the string
+        lits.append((f"TIMESTAMP '{stamp}'", noon))
+        lits.append((f"CAST('{stamp}' AS TIMESTAMP)", noon))
+        lits.append((f"DATE '{date}'", midnight))
+        lits.append((f"CAST('{date}' AS DATE)", midnight))
+        lits.append((f"CAST('{stamp}' AS DATE)", midnight))
         if day % 4 == 1:
-            lits.append((str(us(2024, 1, day)), us(2024, 1, day)))
+            lits.append((str(midnight), midnight))
+        # INTERVAL arithmetic around a literal
+        for unit, span in (("hours", HOUR), ("days", DAY)):
+            count = day % 3 + 1
+            plus = f"'{date}' + INTERVAL '{count} {unit}'"
+            minus = f"'{stamp}' - INTERVAL '{count} {unit}'"
+            lits.append((plus, midnight + count * span))
+            lits.append((minus, noon - count * span))
+        # A month of its calendar length: the parser takes the
+        # shortest below and the longest above, each widened the
+        # way that cannot cut into the real window
+        next_month = to_us(
+            _add_months(datetime(2024, 1, day, tzinfo=timezone.utc), 1)
+        )
+        lits.append((f"'{date}' + INTERVAL '1 month'", next_month))
     return lits
 
 
@@ -991,15 +1228,23 @@ def _leaf(
     rng: random.Random, lits: list[tuple[str, int]]
 ) -> tuple[str, Callable[[int], bool]]:
     if rng.random() < 0.15:
-        # A filter on another column: it matches rows wherever their
-        # _timestamp lies, so it must not narrow anything
-        return "region = 'us'", lambda ts: True
+        # A filter on another column, decoy names among them —
+        # clause-like, window-like, candidate-like — matches rows
+        # wherever their _timestamp lies, so it must not narrow
+        # anything
+        column = rng.choice(("region", "full", "window", "candidate"))
+        return f"{column} = 'us'", lambda ts: True
     if rng.random() < 0.25:
         low, high = rng.sample(lits, 2)
         if low[1] > high[1]:
             low, high = high, low
         sql = f"_timestamp BETWEEN {low[0]} AND {high[0]}"
         return sql, lambda ts, low=low, high=high: low[1] <= ts <= high[1]
+    if rng.random() < 0.2:
+        items = rng.sample(lits, 3)
+        values = [value for _, value in items]
+        sql = "_timestamp IN (" + ", ".join(item for item, _ in items) + ")"
+        return sql, lambda ts, values=values: ts in values
     op = rng.choice([">=", ">", "<", "<=", "=", "<>", "!="])
     literal, value = rng.choice(lits)
     fn = _OPS[op]

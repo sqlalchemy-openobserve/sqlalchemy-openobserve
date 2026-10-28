@@ -2,7 +2,7 @@
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 _HOUR_US = 3_600_000_000
 _DAY_US = 86_400_000_000
@@ -65,6 +65,9 @@ _INTERVAL_US: dict[str, tuple[int, int]] = {
     "yr": (365 * _DAY_US, 366 * _DAY_US),
     "yrs": (365 * _DAY_US, 366 * _DAY_US),
 }
+
+# An INTERVAL string, one <number> <unit> pair at a time.
+_INTERVAL_PAIR = re.compile(r"(\d+(?:\.\d+)?)\s*([a-zA-Z]+)(?:\s+|$)")
 
 _TWO_CHAR_OPS = (">=", "<=", "<>", "!=", "::", "||")
 _ONE_CHAR_OPS = "!+-*/%=<>(),.;~:"
@@ -184,19 +187,52 @@ def _tokenize(sql: str) -> list[_Token]:
     return tokens
 
 
-def _parse_datetime(text: str) -> _TimeValue | None:
+def _iso_datetime(text: str, side: str) -> datetime | None:
     # Python 3.11 parses most ISO 8601: space or "T" separator, "Z"
-    # and numeric offsets; naive strings are read as UTC.
-    value = re.sub(r"(\.\d{6})\d+", r"\g<1>", text.strip())
+    # and numeric offsets; naive strings are read as UTC. Python
+    # also keeps 6 fractional digits, so a lower bound truncates
+    # the rest away and an upper one rounds up onto the next
+    # microsecond, each widened whichever way cannot cut into the
+    # real window.
+    value = text.strip()
+    bump = False
+    fraction = re.search(r"\.(\d+)", value)
+    if fraction is not None and len(fraction.group(1)) > 6:
+        if side == "high" and fraction.group(1)[6:].strip("0"):
+            bump = True
+        value = value[: fraction.start() + 7]
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
+    if bump:
+        parsed += timedelta(microseconds=1)
+    return parsed
+
+
+def _parse_datetime(text: str, side: str) -> _TimeValue | None:
+    parsed = _iso_datetime(text, side)
+    if parsed is None:
+        return None
     return _TimeValue(
-        _delta_us(parsed), _DATE_ONLY.fullmatch(value) is not None
+        _delta_us(parsed), _DATE_ONLY.fullmatch(text.strip()) is not None
     )
+
+
+def _parse_date(text: str) -> _TimeValue | None:
+    # A typed DATE gives midnight whatever the time in the string:
+    # CAST('2024-01-01 12:00:00' AS DATE) bounds from Jan 1 00:00,
+    # not 12:00. The day-granular value covers its whole day on the
+    # upper side. A sub-microsecond fraction is truncated away
+    # rather than rounded up: rounding '23:59:59.9999999' up would
+    # land on the next day.
+    parsed = _iso_datetime(text, "low")
+    if parsed is None:
+        return None
+    midnight = parsed.replace(hour=0, minute=0, second=0, microsecond=0)
+    return _TimeValue(_delta_us(midnight), True)
 
 
 def _now_us() -> int:
@@ -204,15 +240,24 @@ def _now_us() -> int:
 
 
 def _interval_us(text: str, longest: bool) -> int | None:
-    pairs = re.findall(r"(\d+(?:\.\d+)?)\s*([a-zA-Z]+)", text)
-    if not pairs:
+    # A sign, an `ago` or an `hh:mm:ss` part silently drops out of
+    # a findall of the pairs and narrows the bound onto the wrong
+    # side: INTERVAL '-1 day' would read as +1 day, and '1 day
+    # 12:00:00' as 1 day. A string that holds anything besides
+    # <number> <unit> pairs bounds nothing.
+    rest = text.strip()
+    if not rest:
         return None
     total = 0
-    for value, unit in pairs:
-        span = _INTERVAL_US.get(unit.lower())
+    while rest:
+        pair = _INTERVAL_PAIR.match(rest)
+        if pair is None:
+            return None
+        span = _INTERVAL_US.get(pair.group(2).lower())
         if span is None:
             return None
-        total += int(float(value) * (span[1] if longest else span[0]))
+        total += int(float(pair.group(1)) * (span[1] if longest else span[0]))
+        rest = rest[pair.end() :]
     return total
 
 
@@ -238,18 +283,20 @@ def _time_value(tokens: list[_Token], side: str) -> _TimeValue | None:
         if tokens[-3].text == "+":
             return _TimeValue(base.us + span, False)
         return _TimeValue(base.us - span, False)
-    return _base_time_value(tokens)
+    return _base_time_value(tokens, side)
 
 
-def _base_time_value(tokens: list[_Token]) -> _TimeValue | None:
+def _base_time_value(tokens: list[_Token], side: str) -> _TimeValue | None:
     if len(tokens) == 1 and tokens[0].kind == "string":
-        return _parse_datetime(tokens[0].text)
+        return _parse_datetime(tokens[0].text, side)
     if (
         len(tokens) == 2
         and tokens[1].kind == "string"
         and _kw(tokens[0]) in ("TIMESTAMP", "DATE")
     ):
-        return _parse_datetime(tokens[1].text)
+        if _kw(tokens[0]) == "DATE":
+            return _parse_date(tokens[1].text)
+        return _parse_datetime(tokens[1].text, side)
     if len(tokens) == 1 and _kw(tokens[0]) == "CURRENT_TIMESTAMP":
         return _TimeValue(_now_us(), False)
     if (
@@ -261,13 +308,13 @@ def _base_time_value(tokens: list[_Token]) -> _TimeValue | None:
         and tokens[2].text == ")"
     ):
         return _TimeValue(_now_us(), False)
-    cast = _cast_value(tokens)
+    cast = _cast_value(tokens, side)
     if cast is not None:
         return cast
-    return _to_timestamp_value(tokens)
+    return _to_timestamp_value(tokens, side)
 
 
-def _cast_value(tokens: list[_Token]) -> _TimeValue | None:
+def _cast_value(tokens: list[_Token], side: str) -> _TimeValue | None:
     if (
         len(tokens) >= 6
         and _kw(tokens[0]) == "CAST"
@@ -293,12 +340,14 @@ def _cast_value(tokens: list[_Token]) -> _TimeValue | None:
                 and rest[2].kind == "op"
                 and rest[2].text == ")"
             ):
-                if typ.startswith("TIMESTAMP") or typ == "DATE":
-                    return _parse_datetime(inner[0].text)
+                if typ.startswith("TIMESTAMP"):
+                    return _parse_datetime(inner[0].text, side)
+                if typ == "DATE":
+                    return _parse_date(inner[0].text)
     return None
 
 
-def _to_timestamp_value(tokens: list[_Token]) -> _TimeValue | None:
+def _to_timestamp_value(tokens: list[_Token], side: str) -> _TimeValue | None:
     if (
         len(tokens) >= 4
         and tokens[0].kind == "name"
@@ -311,9 +360,12 @@ def _to_timestamp_value(tokens: list[_Token]) -> _TimeValue | None:
         name = tokens[0].text.lower()
         if name == "to_timestamp" or name.startswith("to_timestamp_"):
             args = _split_commas(tokens[2:-1])
-            if len(args) <= 2 and len(args[0]) == 1:
+            # A string is read through the format argument, not as
+            # ISO 8601, so a format leaves the value unresolved
+            # rather than guessed at ISO 8601.
+            if len(args) == 1 and len(args[0]) == 1:
                 if args[0][0].kind == "string":
-                    return _parse_datetime(args[0][0].text)
+                    return _parse_datetime(args[0][0].text, side)
     return None
 
 
@@ -650,7 +702,40 @@ def _stops_clause(tokens: list[_Token], i: int) -> bool:
     if keyword in ("GROUP", "ORDER"):
         return _kw(nxt) == "BY"
     if keyword in ("LIMIT", "OFFSET"):
-        return nxt is not None and nxt.kind == "number"
+        # LIMIT 5 ends the clause, and so do LIMIT ALL, LIMIT (5)
+        # and a trailing LIMIT — the placeholder of LIMIT
+        # %(limit)s, dropped by the tokenizer. LIMIT %s is a
+        # parameter too, but the same shape is a modulo on the
+        # word, so only the one the statement ends with, or OFFSET
+        # follows, is taken for the clause: an arithmetic use
+        # continues with an operator instead.
+        if nxt is None:
+            return True
+        if nxt.kind == "number":
+            return True
+        if _kw(nxt) == "ALL":
+            return True
+        if (
+            nxt.kind == "op"
+            and nxt.text == "("
+            and i + 2 < len(tokens)
+            and tokens[i + 2].kind == "number"
+            and i + 3 < len(tokens)
+            and tokens[i + 3].kind == "op"
+            and tokens[i + 3].text == ")"
+        ):
+            return True
+        if (
+            nxt.kind == "op"
+            and nxt.text == "%"
+            and i + 2 < len(tokens)
+            and tokens[i + 2].kind == "name"
+            and not tokens[i + 2].quoted
+            and tokens[i + 2].text == "s"
+            and (i + 3 >= len(tokens) or _kw(tokens[i + 3]) == "OFFSET")
+        ):
+            return True
+        return False
     if keyword == "WINDOW":
         after = tokens[i + 2] if i + 2 < len(tokens) else None
         return nxt is not None and nxt.kind == "name" and _kw(after) == "AS"
@@ -673,12 +758,19 @@ def _branch_wheres(tokens: list[_Token]) -> list[list[_Token] | None]:
     branches: list[list[_Token] | None] = []
     start: int | None = None
     stop: int | None = None
+    seen = False
     depth = 0
     i = 0
     n = len(tokens)
 
     def cut() -> None:
-        nonlocal start, stop
+        # End the branch at the last cut point. A trailing `;` would
+        # leave an empty one behind, which would count as a branch
+        # without a WHERE and open the window wide, so a branch that
+        # holds no tokens at all is not kept.
+        nonlocal start, stop, seen
+        if not seen and start is None:
+            return
         if start is None:
             branches.append(None)
         elif stop is None:
@@ -687,9 +779,11 @@ def _branch_wheres(tokens: list[_Token]) -> list[list[_Token] | None]:
             branches.append(tokens[start:stop])
         start = None
         stop = None
+        seen = False
 
     while i < n:
         token = tokens[i]
+        seen = True
         if token.kind == "op":
             if token.text == "(":
                 depth += 1
@@ -816,12 +910,15 @@ def extract_time_range(sql: str) -> tuple[int, int]:
 
     A timestamp value is any ISO 8601 literal string, with or without
     TIMESTAMP or DATE typing, CAST, to_timestamp, or now() plus or
-    minus an INTERVAL; the shortest month and year go into a lower
-    bound and the longest into an upper one. A bare integer is an
-    epoch only as 16-digit microseconds, the width of _timestamp
-    itself: shorter ones are seconds or milliseconds, compared as
-    they stand and far tighter than the writer meant, so they bound
-    nothing.
+    minus an INTERVAL; a DATE-typed one lands on midnight whatever the
+    time in the string, a to_timestamp with a format argument and an
+    INTERVAL of anything besides <number> <unit> pairs bound nothing,
+    and a sub-microsecond fraction is truncated away below and rounded
+    up above. The shortest month and year go into a lower bound and
+    the longest into an upper one. A bare integer is an epoch only as
+    16-digit microseconds, the width of _timestamp itself: shorter
+    ones are seconds or milliseconds, compared as they stand and far
+    tighter than the writer meant, so they bound nothing.
     """
     low, high = _analyze(sql)
     if low is None or low < 1:
