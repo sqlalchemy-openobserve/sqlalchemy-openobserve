@@ -381,6 +381,25 @@ def test_date_typed_literal_lands_on_midnight() -> None:
     assert low == us(2024, 1, 1) + 1
 
 
+def test_cast_to_date_takes_the_utc_date() -> None:
+    # The server converts to UTC before it takes the date (checked
+    # against v1.0.4: CAST('2024-01-01T01:00:00+05:00' AS DATE) is
+    # 2023-12-31, not 2024-01-01), so the cast bounds from Dec 31
+    # 00:00 UTC, not from midnight in the literal's own offset
+    sql = (
+        "SELECT * FROM t WHERE _timestamp >= "
+        "CAST('2024-01-01T01:00:00+05:00' AS DATE)"
+    )
+    low, _ = extract_time_range(sql)
+    assert low == us(2023, 12, 31)
+    sql = (
+        "SELECT * FROM t WHERE _timestamp < "
+        "CAST('2024-01-01T23:00:00-05:00' AS DATE)"
+    )
+    _, high = extract_time_range(sql)
+    assert high == us(2024, 1, 2)
+
+
 def test_typed_literal() -> None:
     # v1.0.4 rejects this shape server-side (Int64 >= Timestamp);
     # kept so the parser keeps up with a server that types
@@ -430,6 +449,26 @@ def test_sub_microsecond_equality_window() -> None:
     # and adds its exclusive µs
     assert low == value
     assert high == value + 2
+
+
+def test_fraction_with_offset_keeps_the_offset() -> None:
+    # Dropping the digits past the 6th must not drop a trailing
+    # offset with them: read as UTC, the bound lands hours off
+    # whichever way the offset runs. DataFusion converts the
+    # offset, so the literals mean 05:00:00.123456Z and
+    # 15:00:00.1234567Z.
+    sql = (
+        "SELECT * FROM t WHERE _timestamp >= "
+        "'2024-01-01T10:00:00.1234567+05:00'"
+    )
+    low, _ = extract_time_range(sql)
+    assert low == us(2024, 1, 1, 5, 0, 0, 123456)
+    sql = (
+        "SELECT * FROM t WHERE _timestamp < "
+        "'2024-01-01 10:00:00.1234567-05:00'"
+    )
+    _, high = extract_time_range(sql)
+    assert high == us(2024, 1, 1, 15, 0, 0, 123457)
 
 
 # The local OpenObserve of docker-compose.yml, for the claims the
@@ -612,6 +651,38 @@ def test_ago_interval_bounds_nothing() -> None:
     sql = "SELECT * FROM t WHERE _timestamp >= now() - INTERVAL '1 day ago'"
     low, _ = extract_time_range(sql)
     assert low == 1
+
+
+def test_fractional_year_bounds_nothing() -> None:
+    # DataFusion turns a fractional year into months, not days
+    # (checked against v1.0.4: 2025-01-01 - INTERVAL '0.5 year' is
+    # 2024-07-01, and '0.04 year' is none of them), so no fixed
+    # number of days brackets where it lands: it bounds nothing
+    for interval in ("0.5 year", "0.04 year"):
+        sql = (
+            "SELECT * FROM t WHERE _timestamp >= TIMESTAMP '2025-01-01' "
+            f"- INTERVAL '{interval}'"
+        )
+        low, _ = extract_time_range(sql)
+        assert low == 1, interval
+        sql = (
+            "SELECT * FROM t WHERE _timestamp < TIMESTAMP '2024-07-01' "
+            f"+ INTERVAL '{interval}'"
+        )
+        _, high = extract_time_range(sql)
+        assert high >= now_us(), interval
+
+
+def test_fractional_month_is_days() -> None:
+    # Half a month is 15 days (checked: 2025-01-01 - INTERVAL
+    # '0.5 month' is 2024-12-17), and the lower bound takes half of
+    # the longest month — 15.5 days — to stay under it
+    before = now_us()
+    low, _ = extract_time_range(
+        "SELECT * FROM t WHERE _timestamp >= now() - INTERVAL '0.5 month'"
+    )
+    after = now_us()
+    assert before - 15.5 * DAY <= low <= after - 15.5 * DAY
 
 
 def test_epoch_digit_scales() -> None:
@@ -1184,6 +1255,34 @@ def _literals() -> list[tuple[str, int]]:
             _add_months(datetime(2024, 1, day, tzinfo=timezone.utc), 1)
         )
         lits.append((f"'{date}' + INTERVAL '1 month'", next_month))
+        # A fraction past the 6th digit with an offset: the
+        # fraction truncates onto 6 digits, the offset converts
+        # onto UTC, and the high side rounds up onto the next
+        # microsecond
+        morning = f"'{date}T10:00:00.1234567+05:00'"
+        evening = f"'{date} 10:00:00.1234567-05:00'"
+        lits.append((morning, us(2024, 1, day, 5, 0, 0, 123456)))
+        lits.append((evening, us(2024, 1, day, 15, 0, 0, 123456)))
+        # A DATE cast of a string with an offset: the server
+        # converts to UTC before it takes the date, so it is the
+        # UTC date, a day off the local one at the edges
+        offset_date = f"{date}T01:00:00+05:00"
+        utc_midnight = datetime.fromisoformat(offset_date)
+        utc_midnight = utc_midnight.astimezone(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        lits.append((f"CAST('{offset_date}' AS DATE)", to_us(utc_midnight)))
+        # A fractional year is turned into months — half of one
+        # into six, 0.04 of one into none — not into days, so it
+        # bounds nothing: the parser would guess at days
+        half_year = to_us(
+            _add_months(datetime(2024, 1, day, tzinfo=timezone.utc), -6)
+        )
+        lits.append((f"TIMESTAMP '{date}' - INTERVAL '0.5 year'", half_year))
+        lits.append((f"TIMESTAMP '{date}' + INTERVAL '0.04 year'", midnight))
+        # Half a month is 15 days, inside the shortest and the
+        # longest the parser widens with
+        lits.append((f"'{date}' + INTERVAL '0.5 month'", midnight + 15 * DAY))
     return lits
 
 

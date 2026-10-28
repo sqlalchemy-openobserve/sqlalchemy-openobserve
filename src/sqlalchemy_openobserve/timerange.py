@@ -69,6 +69,10 @@ _INTERVAL_US: dict[str, tuple[int, int]] = {
 # An INTERVAL string, one <number> <unit> pair at a time.
 _INTERVAL_PAIR = re.compile(r"(\d+(?:\.\d+)?)\s*([a-zA-Z]+)(?:\s+|$)")
 
+# A fractional value of one of these is not a fixed number of
+# days: '0.5 year' is six months, not half of 365 or 366 of them.
+_YEAR_UNITS = frozenset(("year", "years", "y", "yr", "yrs"))
+
 _TWO_CHAR_OPS = (">=", "<=", "<>", "!=", "::", "||")
 _ONE_CHAR_OPS = "!+-*/%=<>(),.;~:"
 _NAME_STOP = "'\"`" + _ONE_CHAR_OPS
@@ -200,7 +204,10 @@ def _iso_datetime(text: str, side: str) -> datetime | None:
     if fraction is not None and len(fraction.group(1)) > 6:
         if side == "high" and fraction.group(1)[6:].strip("0"):
             bump = True
-        value = value[: fraction.start() + 7]
+        # Only the digits past the 6th drop: the offset behind them
+        # is part of the literal, and cutting it off would read the
+        # value as UTC, hours off whichever way it runs.
+        value = value[: fraction.start() + 7] + value[fraction.end() :]
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
@@ -224,14 +231,19 @@ def _parse_datetime(text: str, side: str) -> _TimeValue | None:
 def _parse_date(text: str) -> _TimeValue | None:
     # A typed DATE gives midnight whatever the time in the string:
     # CAST('2024-01-01 12:00:00' AS DATE) bounds from Jan 1 00:00,
-    # not 12:00. The day-granular value covers its whole day on the
-    # upper side. A sub-microsecond fraction is truncated away
-    # rather than rounded up: rounding '23:59:59.9999999' up would
-    # land on the next day.
+    # not 12:00. The date is the UTC one — the server converts to
+    # UTC before it takes the date, so '2024-01-01T01:00:00+05:00'
+    # is Dec 31, a day off the date in the string's own offset.
+    # The day-granular value covers its whole day on the upper
+    # side. A sub-microsecond fraction is truncated away rather
+    # than rounded up: rounding '23:59:59.9999999' up would land on
+    # the next day.
     parsed = _iso_datetime(text, "low")
     if parsed is None:
         return None
-    midnight = parsed.replace(hour=0, minute=0, second=0, microsecond=0)
+    midnight = parsed.astimezone(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
     return _TimeValue(_delta_us(midnight), True)
 
 
@@ -253,8 +265,17 @@ def _interval_us(text: str, longest: bool) -> int | None:
         pair = _INTERVAL_PAIR.match(rest)
         if pair is None:
             return None
-        span = _INTERVAL_US.get(pair.group(2).lower())
+        unit = pair.group(2).lower()
+        span = _INTERVAL_US.get(unit)
         if span is None:
+            return None
+        if "." in pair.group(1) and unit in _YEAR_UNITS:
+            # A fractional year is turned into months — '0.5 year'
+            # into six, '0.04 year' into none — not into days, and
+            # neither 365 nor 366 times the fraction brackets where
+            # the months land, so it bounds nothing. A fractional
+            # month is safe: half of one is 15 days, inside the
+            # shortest and the longest.
             return None
         total += int(float(pair.group(1)) * (span[1] if longest else span[0]))
         rest = rest[pair.end() :]
@@ -910,15 +931,18 @@ def extract_time_range(sql: str) -> tuple[int, int]:
 
     A timestamp value is any ISO 8601 literal string, with or without
     TIMESTAMP or DATE typing, CAST, to_timestamp, or now() plus or
-    minus an INTERVAL; a DATE-typed one lands on midnight whatever the
-    time in the string, a to_timestamp with a format argument and an
-    INTERVAL of anything besides <number> <unit> pairs bound nothing,
-    and a sub-microsecond fraction is truncated away below and rounded
-    up above. The shortest month and year go into a lower bound and
-    the longest into an upper one. A bare integer is an epoch only as
-    16-digit microseconds, the width of _timestamp itself: shorter
-    ones are seconds or milliseconds, compared as they stand and far
-    tighter than the writer meant, so they bound nothing.
+    minus an INTERVAL; a DATE-typed one lands on midnight of the UTC
+    date, whatever the time and the offset in the string, and a
+    sub-microsecond fraction is truncated away below and rounded up
+    above, its trailing offset kept. A to_timestamp with a format
+    argument bounds nothing, and so does an INTERVAL of anything
+    besides <number> <unit> pairs — a fractional year among them,
+    which is months, not days. The shortest month and year go into a
+    lower bound and the longest into an upper one. A bare integer is
+    an epoch only as 16-digit microseconds, the width of _timestamp
+    itself: shorter ones are seconds or milliseconds, compared as
+    they stand and far tighter than the writer meant, so they bound
+    nothing.
     """
     low, high = _analyze(sql)
     if low is None or low < 1:
