@@ -9,6 +9,8 @@ built so that Apache Superset can connect to it.
 
 OpenObserve is queried with SQL over an HTTP API. This package exposes it to
 SQLAlchemy so tools built on SQLAlchemy can read from it. It is read-only.
+The client checks connectivity by listing streams; a `SELECT 1` probe is not
+valid because OpenObserve queries must reference a stream.
 
 The Superset side (the DB engine spec) will live in the Apache Superset
 repository, not here.
@@ -29,6 +31,13 @@ openobserve://{email}:{password}@{host}:{port}/{organization}
 ## Requirements
 
 Python 3.11 or newer, SQLAlchemy 2.0.52 or newer in the 2.0 series.
+
+## Superset compatibility
+
+This package targets Apache Superset 7 and has not yet been tested with it.
+Superset 6.x and earlier are not supported: they pin SQLAlchemy below 2.0, and
+this package needs SQLAlchemy 2.0.52 or newer, so pip cannot install the two
+together.
 
 ## Development
 
