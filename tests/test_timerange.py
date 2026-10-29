@@ -685,6 +685,55 @@ def test_fractional_month_is_days() -> None:
     assert before - 15.5 * DAY <= low <= after - 15.5 * DAY
 
 
+def test_fractional_interval_is_exact() -> None:
+    # float('4.1') * 1_000_000 comes to 4099999.999…, and a window
+    # truncated onto 4099999 ends a microsecond under the real bound,
+    # X + 4.1s, cutting off a row stamped exactly there
+    sql = (
+        "SELECT * FROM t WHERE _timestamp < "
+        "TIMESTAMP '2025-01-01' + INTERVAL '4.1 seconds'"
+    )
+    _, high = extract_time_range(sql)
+    assert high == us(2025, 1, 1) + 4_100_000
+    sql = (
+        "SELECT * FROM t WHERE _timestamp >= "
+        "TIMESTAMP '2025-01-01' - INTERVAL '4.1 seconds'"
+    )
+    low, _ = extract_time_range(sql)
+    assert low == us(2025, 1, 1) - 4_100_000
+
+
+def test_fractional_interval_residue_rounds_outward() -> None:
+    # A residue past the microsecond rounds the way the bound is
+    # widened, whichever way cannot cut into the real window: up onto
+    # the next microsecond where the product widens the window, down
+    # onto this one where it narrows
+    sql = (
+        "SELECT * FROM t WHERE _timestamp < "
+        "TIMESTAMP '2025-01-01' + INTERVAL '4.0000001 seconds'"
+    )
+    _, high = extract_time_range(sql)
+    assert high == us(2025, 1, 1) + 4_000_001
+    sql = (
+        "SELECT * FROM t WHERE _timestamp >= "
+        "TIMESTAMP '2025-01-01' + INTERVAL '4.0000001 seconds'"
+    )
+    low, _ = extract_time_range(sql)
+    assert low == us(2025, 1, 1) + 4_000_000
+    sql = (
+        "SELECT * FROM t WHERE _timestamp < "
+        "TIMESTAMP '2025-01-01' - INTERVAL '4.0000001 seconds'"
+    )
+    _, high = extract_time_range(sql)
+    assert high == us(2025, 1, 1) - 4_000_000
+    sql = (
+        "SELECT * FROM t WHERE _timestamp >= "
+        "TIMESTAMP '2025-01-01' - INTERVAL '4.0000001 seconds'"
+    )
+    low, _ = extract_time_range(sql)
+    assert low == us(2025, 1, 1) - 4_000_001
+
+
 def test_epoch_digit_scales() -> None:
     # _timestamp is microseconds, so only a 16-digit integer is one
     # of those: the server compares shorter ones as they stand,

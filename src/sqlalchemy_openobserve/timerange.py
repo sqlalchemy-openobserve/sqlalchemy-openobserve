@@ -1,8 +1,10 @@
 """Work out the time range of a query"""
 
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from fractions import Fraction
 
 _HOUR_US = 3_600_000_000
 _DAY_US = 86_400_000_000
@@ -277,7 +279,15 @@ def _interval_us(text: str, longest: bool) -> int | None:
             # month is safe: half of one is 15 days, inside the
             # shortest and the longest.
             return None
-        total += int(float(pair.group(1)) * (span[1] if longest else span[0]))
+        # A float would lose a microsecond: float('4.1') * 1_000_000
+        # comes to 4099999.999…, and int() truncates onto 4099999, a
+        # microsecond under the X + 4.1s the filter means, cutting off
+        # a row stamped exactly there. A fraction is exact, and a
+        # residue past the microsecond rounds the way the bound is
+        # widened: up onto the next one with the longest span, down
+        # onto this one with the shortest.
+        span_us = Fraction(pair.group(1)) * (span[1] if longest else span[0])
+        total += math.ceil(span_us) if longest else math.floor(span_us)
         rest = rest[pair.end() :]
     return total
 
@@ -938,8 +948,11 @@ def extract_time_range(sql: str) -> tuple[int, int]:
     argument bounds nothing, and so does an INTERVAL of anything
     besides <number> <unit> pairs — a fractional year among them,
     which is months, not days. The shortest month and year go into a
-    lower bound and the longest into an upper one. A bare integer is
-    an epoch only as 16-digit microseconds, the width of _timestamp
+    lower bound and the longest into an upper one. A fractional value
+    is exact — a float would come a microsecond short — and a residue
+    past the microsecond rounds outward, up with the longest span
+    and down with the shortest. A bare integer is an epoch only as
+    16-digit microseconds, the width of _timestamp
     itself: shorter ones are seconds or milliseconds, compared as
     they stand and far tighter than the writer meant, so they bound
     nothing.
