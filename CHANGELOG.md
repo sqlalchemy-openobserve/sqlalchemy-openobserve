@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Implement the DBAPI `connect()`, `Connection` and `Cursor`. A query
+  runs as one OpenObserve search over the time range its SQL implies,
+  with no row cap beyond the SQL's own LIMIT.
 - `extract_time_range()` works out the time range of a search from the
   time comparisons in its SQL, replacing the unimplemented stub.
 - Package skeleton. No working functionality yet.
