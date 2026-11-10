@@ -1,5 +1,7 @@
 """DBAPI 2.0 (PEP 249) driver for OpenObserve"""
 
+import datetime
+import time
 from typing import Any
 
 from . import statements
@@ -57,9 +59,59 @@ class NotSupportedError(DatabaseError):
     pass
 
 
-# OpenObserve's QUERY_WITH_NO_LIMIT. Any other size caps the rows a search
-# returns without marking the response partial, so the SQL's own LIMIT is
-# left to decide.
+Date = datetime.date
+Time = datetime.time
+Timestamp = datetime.datetime
+Binary = bytes
+
+
+def DateFromTicks(ticks: float) -> datetime.date:
+    return Date(*time.localtime(ticks)[:3])
+
+
+def TimeFromTicks(ticks: float) -> datetime.time:
+    return Time(*time.localtime(ticks)[3:6])
+
+
+def TimestampFromTicks(ticks: float) -> datetime.datetime:
+    return Timestamp(*time.localtime(ticks)[:6])
+
+
+class _TypeObject:
+    """Compares equal to each of the OpenObserve type names it groups."""
+
+    def __init__(self, *type_names: str) -> None:
+        self.type_names = frozenset(type_names)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, str) and other in self.type_names
+
+    def __hash__(self) -> int:
+        return hash(self.type_names)
+
+
+STRING = _TypeObject("Utf8", "LargeUtf8")
+BINARY = _TypeObject("Binary", "LargeBinary")
+NUMBER = _TypeObject(
+    "Int8",
+    "Int16",
+    "Int32",
+    "Int64",
+    "UInt8",
+    "UInt16",
+    "UInt32",
+    "UInt64",
+    "Float32",
+    "Float64",
+)
+DATETIME = _TypeObject("Date32", "Date64", "Timestamp")
+ROWID = _TypeObject()
+
+
+# OpenObserve's QUERY_WITH_NO_LIMIT. A positive size caps the rows a search
+# returns without marking the response partial, and any other size falls
+# back to the server's default limit, so only this one leaves the SQL's own
+# LIMIT to decide.
 _NO_LIMIT = -999
 
 Row = tuple[Any, ...]
@@ -104,7 +156,7 @@ class Cursor:
             )
         start_time, end_time = extract_time_range(sql)
         try:
-            result = self.connection._client.search(
+            result = self.connection.client.search(
                 sql, start_time, end_time, size=_NO_LIMIT
             )
         except QueryError as exc:
@@ -112,9 +164,10 @@ class Cursor:
         except OpenObserveError as exc:
             raise OperationalError(str(exc)) from exc
         if result["is_partial"]:
-            raise OperationalError(
-                "OpenObserve returned partial results for this query"
-            )
+            message = "OpenObserve returned partial results for this query"
+            if result["function_error"]:
+                message += ": " + "; ".join(result["function_error"])
+            raise OperationalError(message)
 
         # The search API returns column names without types
         self.description = [
@@ -139,6 +192,8 @@ class Cursor:
         self._check_result()
         if size is None:
             size = self.arraysize
+        if size < 0:
+            raise ProgrammingError("fetchmany() size must not be negative")
         rows = self._rows[self._position : self._position + size]
         self._position += len(rows)
         return rows
@@ -162,7 +217,7 @@ class Cursor:
 
 class Connection:
     def __init__(self, client: OpenObserveClient) -> None:
-        self._client = client
+        self.client = client
         self._closed = False
 
     def _check_open(self) -> None:
@@ -183,7 +238,7 @@ class Connection:
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            self._client.close()
+            self.client.close()
 
 
 def connect(

@@ -1,5 +1,7 @@
 """Tests for the DBAPI connection and cursor"""
 
+import datetime
+import time
 from typing import Any
 from unittest.mock import Mock
 
@@ -22,6 +24,7 @@ def client() -> Mock:
         "columns": ["level", "count"],
         "rows": [["info", 3], ["warn", 2], ["error", 1]],
         "is_partial": False,
+        "function_error": [],
     }
     return client
 
@@ -108,6 +111,7 @@ def test_empty_result_has_empty_description(
         "columns": [],
         "rows": [],
         "is_partial": False,
+        "function_error": [],
     }
 
     cursor.execute(SQL)
@@ -190,6 +194,22 @@ def test_partial_results_raise(cursor: dbapi.Cursor, client: Mock) -> None:
     assert cursor.description is None
 
 
+def test_partial_results_error_gives_server_reason(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value["is_partial"] = True
+    client.search.return_value["function_error"] = [
+        "Query hit the default limit",
+        "Partition failed",
+    ]
+
+    with pytest.raises(
+        dbapi.OperationalError,
+        match="default limit; Partition failed",
+    ):
+        cursor.execute(SQL)
+
+
 def test_failed_execute_clears_previous_result(
     cursor: dbapi.Cursor, client: Mock
 ) -> None:
@@ -224,6 +244,15 @@ def test_fetchmany_uses_size_then_arraysize(cursor: dbapi.Cursor) -> None:
     assert cursor.fetchmany() == [("warn", 2), ("error", 1)]
 
 
+def test_fetchmany_rejects_negative_size(cursor: dbapi.Cursor) -> None:
+    cursor.execute(SQL)
+
+    with pytest.raises(dbapi.ProgrammingError, match="negative"):
+        cursor.fetchmany(-1)
+
+    assert cursor.fetchall() == [("info", 3), ("warn", 2), ("error", 1)]
+
+
 def test_execute_again_replaces_the_result(
     cursor: dbapi.Cursor, client: Mock
 ) -> None:
@@ -233,6 +262,7 @@ def test_execute_again_replaces_the_result(
         "columns": ["n"],
         "rows": [[7]],
         "is_partial": False,
+        "function_error": [],
     }
 
     cursor.execute("select count(*) as n from app_logs")
@@ -286,3 +316,52 @@ def test_cursor_knows_its_connection(
     connection: dbapi.Connection, cursor: dbapi.Cursor
 ) -> None:
     assert cursor.connection is connection
+
+
+def test_connection_exposes_its_client(
+    connection: dbapi.Connection, client: Mock
+) -> None:
+    assert connection.client is client
+
+
+def test_date_and_time_constructors() -> None:
+    assert dbapi.Date(2026, 11, 10) == datetime.date(2026, 11, 10)
+    assert dbapi.Time(12, 30, 45) == datetime.time(12, 30, 45)
+    assert dbapi.Timestamp(2026, 11, 10, 12, 30, 45) == datetime.datetime(
+        2026, 11, 10, 12, 30, 45
+    )
+    assert dbapi.Binary(b"\x00\xff") == b"\x00\xff"
+
+
+def test_from_ticks_constructors_use_local_time() -> None:
+    ticks = time.mktime((2026, 11, 10, 12, 30, 45, 0, 0, -1))
+
+    assert dbapi.DateFromTicks(ticks) == datetime.date(2026, 11, 10)
+    assert dbapi.TimeFromTicks(ticks) == datetime.time(12, 30, 45)
+    assert dbapi.TimestampFromTicks(ticks) == datetime.datetime(
+        2026, 11, 10, 12, 30, 45
+    )
+
+
+@pytest.mark.parametrize(
+    "type_object, type_name",
+    [
+        (dbapi.STRING, "Utf8"),
+        (dbapi.BINARY, "Binary"),
+        (dbapi.NUMBER, "Int64"),
+        (dbapi.NUMBER, "Float64"),
+        (dbapi.DATETIME, "Timestamp"),
+    ],
+)
+def test_type_objects_match_their_type_names(
+    type_object: object, type_name: str
+) -> None:
+    assert type_object == type_name
+    assert type_name == type_object
+
+
+def test_type_objects_do_not_match_other_type_codes() -> None:
+    assert dbapi.STRING != "Int64"
+    assert dbapi.NUMBER != "Utf8"
+    assert dbapi.STRING != None  # noqa: E711
+    assert dbapi.ROWID != "Utf8"
