@@ -263,10 +263,27 @@ def test_compiled_sql_leaves_out_schema(dialect: OpenObserveDialect) -> None:
         .group_by(logs.c.level)
     )
 
-    sql = str(query.compile(dialect=dialect))
+    sql = str(
+        query.compile(dialect=dialect, compile_kwargs={"literal_binds": True})
+    )
 
-    assert "default" not in sql
-    assert "FROM app_logs" in sql
+    # SQLAlchemy aliases a schema-qualified table whose schema is left out,
+    # so it can't be confused with a table of the same name in no schema
+    assert sql == (
+        "SELECT app_logs_1.level, count(*) AS count_1 \n"
+        "FROM app_logs AS app_logs_1 \n"
+        "WHERE app_logs_1.level = 'error' GROUP BY app_logs_1.level"
+    )
+
+
+def test_compiled_sql_without_schema_has_no_alias(
+    dialect: OpenObserveDialect,
+) -> None:
+    logs = table("app_logs", column("level"))
+
+    sql = str(select(logs.c.level).compile(dialect=dialect))
+
+    assert sql == "SELECT app_logs.level \nFROM app_logs"
 
 
 def test_inspector_through_an_engine(
