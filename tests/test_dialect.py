@@ -168,7 +168,7 @@ def test_columns_map_openobserve_types(
 
     client.stream_schema.assert_called_once_with("app_logs")
     assert [(c["name"], type(c["type"]), c["nullable"]) for c in columns] == [
-        ("_timestamp", sqltypes.TIMESTAMP, False),
+        ("_timestamp", sqltypes.BigInteger, False),
         ("level", sqltypes.String, True),
         ("status", sqltypes.BigInteger, True),
         ("duration_ms", sqltypes.Double, True),
@@ -343,7 +343,7 @@ def test_ping_and_reflection_against_real_server() -> None:
 
     assert "app_logs" in inspector.get_table_names()
     columns = {c["name"]: c["type"] for c in inspector.get_columns("app_logs")}
-    assert isinstance(columns["_timestamp"], sqltypes.TIMESTAMP)
+    assert isinstance(columns["_timestamp"], sqltypes.BigInteger)
     assert isinstance(columns["level"], sqltypes.String)
     with pytest.raises(exc.NoSuchTableError):
         inspector.get_columns("no_such_stream")
