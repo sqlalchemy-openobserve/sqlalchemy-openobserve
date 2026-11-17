@@ -16,6 +16,12 @@ class QueryError(OpenObserveError):
     """OpenObserve rejected a query."""
 
 
+def _is_str_list(value: object) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(item, str) for item in value
+    )
+
+
 class OpenObserveClient:
     """Talks to one OpenObserve organization over HTTP."""
 
@@ -120,10 +126,31 @@ class OpenObserveClient:
             raise OpenObserveError(
                 "OpenObserve search response must be an object"
             )
+        columns = result.get("columns", [])
+        rows = result.get("hits", result.get("rows", []))
+        # The reason a response is partial (default limit, node failure,
+        # clipped time range)
+        function_error = result.get("function_error", [])
+        if not _is_str_list(columns):
+            raise OpenObserveError(
+                "OpenObserve search columns must be a list of strings"
+            )
+        if not isinstance(rows, list) or not all(
+            isinstance(row, list) and len(row) == len(columns) for row in rows
+        ):
+            raise OpenObserveError(
+                "OpenObserve search rows must be lists with one value per "
+                "column"
+            )
+        if not _is_str_list(function_error):
+            raise OpenObserveError(
+                "OpenObserve search function_error must be a list of strings"
+            )
         return {
-            "columns": result.get("columns", []),
-            "rows": result.get("hits", result.get("rows", [])),
+            "columns": columns,
+            "rows": rows,
             "is_partial": result.get("is_partial", False),
+            "function_error": function_error,
         }
 
     def list_streams(self, stream_type: StreamType = "logs") -> list[str]:

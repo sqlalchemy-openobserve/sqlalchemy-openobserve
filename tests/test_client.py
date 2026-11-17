@@ -1,3 +1,4 @@
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -39,6 +40,7 @@ def test_search_posts_query_with_basic_auth(
         "columns": ["level"],
         "rows": [["info"]],
         "is_partial": True,
+        "function_error": [],
     }
     assert session.auth == ("user", "pass")
     session.request.assert_called_once_with(
@@ -119,6 +121,62 @@ def test_search_uses_http_error_for_invalid_400_body(
 
     with pytest.raises(OpenObserveError, match="400 Bad Request"):
         client.search("select * from", 10, 20)
+
+
+def test_search_returns_function_error(
+    session: Mock, client: OpenObserveClient
+) -> None:
+    session.request.return_value.json.return_value = {
+        "columns": ["level"],
+        "hits": [["info"]],
+        "is_partial": True,
+        "function_error": ["Query hit the default limit"],
+    }
+
+    result = client.search("select * from logs", 10, 20)
+
+    assert result["function_error"] == ["Query hit the default limit"]
+
+
+def test_search_accepts_empty_response(
+    session: Mock, client: OpenObserveClient
+) -> None:
+    session.request.return_value.json.return_value = {"hits": []}
+
+    assert client.search("select * from logs", 10, 20) == {
+        "columns": [],
+        "rows": [],
+        "is_partial": False,
+        "function_error": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "body, message",
+    [
+        ({"columns": "level", "hits": []}, "columns"),
+        ({"columns": [1], "hits": []}, "columns"),
+        ({"columns": ["level"], "hits": {"level": "info"}}, "rows"),
+        ({"columns": ["level"], "hits": [{"level": "info"}]}, "rows"),
+        ({"columns": ["level"], "hits": ["info"]}, "rows"),
+        ({"columns": ["level"], "hits": [["info", 1]]}, "rows"),
+        ({"columns": [], "hits": [["info"]]}, "rows"),
+        (
+            {"columns": [], "hits": [], "function_error": "limit"},
+            "function_error",
+        ),
+    ],
+)
+def test_search_rejects_malformed_response(
+    session: Mock,
+    client: OpenObserveClient,
+    body: dict[str, Any],
+    message: str,
+) -> None:
+    session.request.return_value.json.return_value = body
+
+    with pytest.raises(OpenObserveError, match=message):
+        client.search("select * from logs", 10, 20)
 
 
 def test_list_streams_returns_stream_names(
