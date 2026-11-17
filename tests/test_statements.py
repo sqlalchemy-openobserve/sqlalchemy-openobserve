@@ -53,7 +53,16 @@ def test_render_supported_types(value: object, literal: str) -> None:
     assert render("SELECT %(value)s", {"value": value}) == f"SELECT {literal}"
 
 
-@pytest.mark.parametrize("value", [float("inf"), Decimal("NaN")])
+@pytest.mark.parametrize(
+    "value",
+    [
+        float("inf"),
+        float("-inf"),
+        float("nan"),
+        Decimal("NaN"),
+        Decimal("-Infinity"),
+    ],
+)
 def test_render_rejects_non_finite_numbers(value: object) -> None:
     with pytest.raises(ValueError, match="non-finite"):
         render("SELECT %(value)s", {"value": value})
@@ -75,6 +84,10 @@ def test_render_rejects_unsupported_type() -> None:
         "SELECT update, replace(message, 'a', 'b') FROM logs",
         "SHOW TABLES",
         "EXPLAIN SELECT * FROM logs;",
+        "SELECT * FROM a UNION SELECT * FROM b",
+        "SELECT * FROM a UNION ALL SELECT * FROM b EXCEPT SELECT * FROM c",
+        "WITH a AS (WITH b AS (SELECT * FROM logs) SELECT * FROM b) "
+        "SELECT * FROM a",
     ],
 )
 def test_read_only_queries(sql: str) -> None:
@@ -93,6 +106,10 @@ def test_read_only_queries(sql: str) -> None:
         "WITH recent AS (SELECT * FROM logs) "
         "INSERT INTO archive SELECT * FROM recent",
         "SELECT * FROM (DELETE FROM logs RETURNING *) AS removed",
+        "WITH d AS (DELETE FROM b RETURNING *) "
+        "SELECT * FROM a UNION SELECT * FROM d",
+        "WITH a AS (WITH b AS (DELETE FROM logs RETURNING *) "
+        "SELECT * FROM b) SELECT * FROM a",
         "",
     ],
 )
@@ -133,6 +150,23 @@ def test_write_and_injection_attempts_are_rejected(sql: str) -> None:
         ("(SELECT * FROM logs)", "logs"),
         ("WITH x AS (SELECT 1) SELECT * FROM x JOIN logs ON true", "logs"),
         ("SELECT 1", None),
+        (
+            "WITH a AS (WITH c AS (SELECT * FROM logs) SELECT * FROM c) "
+            "SELECT * FROM a",
+            "logs",
+        ),
+        (
+            "WITH a AS (WITH c AS (SELECT * FROM logs) SELECT * FROM c), "
+            "b AS (SELECT * FROM a) SELECT * FROM b",
+            "logs",
+        ),
+        ("SELECT * FROM a EXCEPT SELECT * FROM b", None),
+        (
+            "WITH a AS (WITH c AS (SELECT * FROM secret) SELECT * FROM c) "
+            "SELECT * FROM c",
+            "c",
+        ),
+        ("SELECT * FROM a INTERSECT SELECT * FROM a", None),
     ],
 )
 def test_stream_ref(sql: str, expected: str | None) -> None:
@@ -155,6 +189,7 @@ def test_stream_ref(sql: str, expected: str | None) -> None:
         "SELECT * FROM a UNION SELECT * FROM b UNION SELECT * FROM c",
         "(SELECT _timestamp FROM logs)",
         "(SELECT _timestamp FROM a) UNION (SELECT _timestamp FROM b)",
+        "SELECT _timestamp FROM a EXCEPT SELECT message FROM b",
     ],
 )
 def test_selects_timestamp(sql: str) -> None:
@@ -172,6 +207,7 @@ def test_selects_timestamp(sql: str) -> None:
         "SELECT DISTINCT max(_timestamp) FROM logs",
         "(SELECT message FROM logs)",
         "SELECT message FROM a UNION SELECT _timestamp FROM b",
+        "SELECT message FROM a INTERSECT SELECT _timestamp FROM b",
     ],
 )
 def test_does_not_select_raw_timestamp(sql: str) -> None:

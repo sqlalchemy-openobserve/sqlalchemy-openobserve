@@ -5,6 +5,9 @@ description = "SQLAlchemy dialect and DBAPI driver for OpenObserve"
 authors = [
     {name = "Milen Thomas"},
     {name = "Andy Yang"},
+    {name = "Kushal Patel"},
+    {name = "Chang Ma"},
+    {name = "Luyuan Ge"},
 ]
 readme = "README.md"
 license = "Apache-2.0"

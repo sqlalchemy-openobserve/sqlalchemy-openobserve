@@ -206,6 +206,7 @@ def selects_timestamp(sql: str) -> bool:
     """Return whether the outer query outputs raw ``_timestamp`` or ``*``.
 
     A set operation is judged by its leftmost query, which names its columns.
+    Renaming it hides the column, so ``SELECT _timestamp AS ts`` is False.
     """
     statement = _parse_one(sql)
     while isinstance(statement, (exp.SetOperation, exp.Subquery)):
