@@ -37,7 +37,12 @@ Name new test files after the module they test, for example
 `tests/test_timerange.py` for `timerange.py`.
 
 CI does not start an OpenObserve server, so everything under `tests/` must
-pass without one. Integration tests against a live server are not set up yet.
+pass, or be skipped, without one. With the server from `docker compose up -d`
+running, `pytest` also runs the tests in `tests/integration/`, which create
+their own stream and delete it afterwards. Two older tests, in
+`tests/test_dialect.py` and `tests/test_timerange.py`, read the `app_logs`
+sample data, so load it first. All of these are skipped when the server is not
+running.
 
 ## Branches and pull requests
 
