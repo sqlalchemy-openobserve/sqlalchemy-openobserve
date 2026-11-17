@@ -6,7 +6,7 @@
   (with `?ssl=false` and `?verify=`) onto `connect()`, pings with the
   client instead of `SELECT 1`, and reflects logs streams as tables in a
   single `default` schema that compiled SQL leaves out. `_timestamp`
-  reflects as `TIMESTAMP`.
+  reflects as the `BIGINT` it is (microseconds since the epoch).
 - Implement the DBAPI `connect()`, `Connection` and `Cursor`, with the
   PEP 249 type objects and constructors. Once the statements helpers are
   implemented, a query runs as one OpenObserve search over the time range

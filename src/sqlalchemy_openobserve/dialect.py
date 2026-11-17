@@ -54,9 +54,10 @@ _TYPES: dict[str, type[sqltypes.TypeEngine[Any]]] = {
 
 
 def _column_type(name: str, type_name: str) -> sqltypes.TypeEngine[Any]:
-    # _timestamp is Int64 microseconds, but it is the time column of every
-    # stream, so tools such as Superset should treat it as one
-    if name == "_timestamp" or type_name.startswith("Timestamp"):
+    # _timestamp stays the Int64 it is (microseconds since the epoch): the
+    # server rejects comparing it with a timestamp, and returns it as an
+    # integer. Superset's engine spec marks it as the time column.
+    if type_name.startswith("Timestamp"):
         return sqltypes.TIMESTAMP()
     if type_name in _TYPES:
         return _TYPES[type_name]()
