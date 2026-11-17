@@ -202,16 +202,20 @@ class Cursor:
         columns: list[str] = list(result["columns"])
         rows: list[Row] = [tuple(row) for row in result["rows"]]
         plain = statements.plain_columns(sql)
-        schema = self._stream_schema(sql)
+        # Only a star or a column passed through unchanged uses the schema
+        needs_schema = plain is None or bool(plain)
+        schema = self._stream_schema(sql) if needs_schema else {}
 
         selected = statements.output_columns(sql, list(schema))
         if not columns:
             columns = selected or []
         elif columns[0] == "_timestamp":
             # Counted, not read from the SQL: an expression can be aliased
-            # _timestamp
+            # _timestamp. A selected _timestamp, or a star, is never prepended.
             prepended = (
-                selected is not None and len(columns) == len(selected) + 1
+                selected is not None
+                and not statements.selects_timestamp(sql)
+                and len(columns) == len(selected) + 1
             )
             if prepended:
                 columns = columns[1:]
