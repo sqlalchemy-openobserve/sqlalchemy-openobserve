@@ -8,6 +8,8 @@ import pytest
 
 from sqlalchemy_openobserve.statements import (
     is_read_only,
+    output_columns,
+    plain_columns,
     render,
     selects_timestamp,
     stream_ref,
@@ -212,3 +214,49 @@ def test_selects_timestamp(sql: str) -> None:
 )
 def test_does_not_select_raw_timestamp(sql: str) -> None:
     assert not selects_timestamp(sql)
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("SELECT level, status FROM logs", ["level", "status"]),
+        ("SELECT logs.level AS l, status s FROM logs", ["l", "s"]),
+        ("SELECT * FROM logs", ["a", "b"]),
+        ("SELECT logs.*, 1 AS one FROM logs", ["a", "b", "one"]),
+        ("SELECT count(*) FROM logs", ["count(*)"]),
+        ("SELECT COUNT(*), Max(a) FROM logs", ["count(*)", "max(a)"]),
+        ('SELECT a AS Lv, a AS "Lv" FROM logs', ["lv", "Lv"]),
+        ("WITH c AS (SELECT a FROM x) SELECT * FROM c", None),
+        ("SELECT * FROM (SELECT a FROM x) t", None),
+        ("SELECT * FROM x JOIN y ON x.a = y.a", None),
+        ("SELECT count(*) AS n FROM logs", ["n"]),
+        ("SELECT a FROM x UNION ALL SELECT b FROM y", ["a"]),
+        ("(SELECT a FROM x) UNION (SELECT b FROM y)", ["a"]),
+        ("WITH c AS (SELECT a FROM x) SELECT a FROM c", ["a"]),
+        ("SHOW STREAMS", None),
+        ("DELETE FROM logs", None),
+        ("not sql at all (", None),
+    ],
+)
+def test_output_columns(sql: str, expected: list[str] | None) -> None:
+    assert output_columns(sql, ["a", "b"]) == expected
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("SELECT level, logs.status FROM logs", {"level", "status"}),
+        ("SELECT level AS level, status AS code FROM logs", {"level"}),
+        ("SELECT status AS level, level AS status FROM logs", set()),
+        ("SELECT cast(status AS VARCHAR) AS status FROM logs", set()),
+        ("SELECT count(*), max(a) AS a FROM logs", set()),
+        ("SELECT * FROM logs", None),
+        ("SELECT a, * FROM logs", None),
+        ("SELECT a FROM x UNION ALL SELECT b FROM y", {"a"}),
+        ("SHOW STREAMS", set()),
+        ("WITH c AS (SELECT a FROM x) SELECT a FROM c", set()),
+        ("WITH c AS (SELECT a FROM x) SELECT * FROM c", set()),
+    ],
+)
+def test_plain_columns(sql: str, expected: set[str] | None) -> None:
+    assert plain_columns(sql) == expected

@@ -117,6 +117,36 @@ _NO_LIMIT = -999
 Row = tuple[Any, ...]
 
 
+def _value_type(rows: list[Row], index: int) -> str | None:
+    for row in rows:
+        value = row[index]
+        # bool is an int subclass, so it has to come first
+        if isinstance(value, bool):
+            return "Boolean"
+        if isinstance(value, int):
+            return "Int64"
+        if isinstance(value, float):
+            return "Float64"
+        if isinstance(value, str):
+            return "Utf8"
+        if value is not None:
+            return None
+    return None
+
+
+def _type_code(
+    name: str,
+    index: int,
+    schema: dict[str, str],
+    plain: set[str] | None,
+    rows: list[Row],
+) -> str | None:
+    """The stream field's type if passed through, else the values' type."""
+    if name in schema and (plain is None or name in plain):
+        return schema[name]
+    return _value_type(rows, index)
+
+
 class Cursor:
     arraysize = 1
     lastrowid = None
@@ -169,13 +199,42 @@ class Cursor:
                 message += ": " + "; ".join(result["function_error"])
             raise OperationalError(message)
 
-        # The search API returns column names without types
+        columns: list[str] = list(result["columns"])
+        rows: list[Row] = [tuple(row) for row in result["rows"]]
+        plain = statements.plain_columns(sql)
+        schema = self._stream_schema(sql)
+
+        selected = statements.output_columns(sql, list(schema))
+        if not columns:
+            columns = selected or []
+        elif columns[0] == "_timestamp":
+            # Counted, not read from the SQL: an expression can be aliased
+            # _timestamp
+            prepended = (
+                selected is not None and len(columns) == len(selected) + 1
+            )
+            if prepended:
+                columns = columns[1:]
+                rows = [row[1:] for row in rows]
+
         self.description = [
-            (name, None, None, None, None, None, None)
-            for name in result["columns"]
+            (name, _type_code(name, index, schema, plain, rows)) + (None,) * 5
+            for index, name in enumerate(columns)
         ]
-        self._rows = [tuple(row) for row in result["rows"]]
-        self.rowcount = len(self._rows)
+        self._rows = rows
+        self.rowcount = len(rows)
+
+    def _stream_schema(self, sql: str) -> dict[str, str]:
+        # The server accepts names the schema API rejects, such as
+        # default.app_logs, so a failure must not fail a query that ran
+        stream = statements.stream_ref(sql)
+        if stream is None:
+            return {}
+        try:
+            fields = self.connection.client.stream_schema(stream)
+        except OpenObserveError:
+            return {}
+        return {field["name"]: field["type"] for field in fields}
 
     def executemany(self, operation: str, seq_of_parameters: Any) -> None:
         raise NotSupportedError("OpenObserve is read-only through this driver")

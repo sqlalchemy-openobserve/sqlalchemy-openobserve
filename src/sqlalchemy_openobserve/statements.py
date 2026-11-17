@@ -236,3 +236,78 @@ def selects_timestamp(sql: str) -> bool:
         ):
             return True
     return False
+
+
+def _outer_select(sql: str) -> exp.Select | None:
+    statement = _parse_one(sql)
+    while isinstance(statement, (exp.SetOperation, exp.Subquery)):
+        statement = statement.this
+    return statement if isinstance(statement, exp.Select) else None
+
+
+def _is_star(projection: exp.Expression) -> bool:
+    return isinstance(projection, exp.Star) or (
+        isinstance(projection, exp.Column)
+        and isinstance(projection.this, exp.Star)
+    )
+
+
+def output_columns(sql: str, stream_fields: list[str]) -> list[str] | None:
+    """Return the column names the outer SELECT outputs, or None if unknown.
+
+    The server names no columns for a result with no rows. ``*`` expands only
+    over a stream read directly, not a CTE, subquery or join. Unnamed
+    expressions are named by their SQL text, which the server may spell
+    differently (``max(logs.status)``).
+    """
+    statement = _outer_select(sql)
+    if statement is None:
+        return None
+
+    names: list[str] = []
+    for projection in statement.expressions:
+        if _is_star(projection):
+            source = statement.args.get("from_")
+            if (
+                statement.args.get("with_")
+                or statement.args.get("joins")
+                or source is None
+                or not isinstance(source.this, exp.Table)
+            ):
+                return None
+            names.extend(stream_fields)
+        elif isinstance(projection, exp.Alias):
+            alias = projection.args["alias"]
+            names.append(alias.name if alias.quoted else alias.name.lower())
+        elif isinstance(projection, exp.Column):
+            names.append(projection.name)
+        else:
+            names.append(projection.sql(normalize_functions="lower"))
+    return names
+
+
+def plain_columns(sql: str) -> set[str] | None:
+    """Return the fields the outer SELECT passes through unchanged.
+
+    None means ``*``. A column renamed or computed is left out, so its output
+    name is not mistaken for the stream field of that name, and so is
+    everything under a CTE, which can rename fields.
+    """
+    statement = _outer_select(sql)
+    if statement is None or statement.args.get("with_"):
+        return set()
+
+    names: set[str] = set()
+    for projection in statement.expressions:
+        if _is_star(projection):
+            return None
+        value = (
+            projection.this
+            if isinstance(projection, exp.Alias)
+            else projection
+        )
+        if isinstance(value, exp.Column) and (
+            projection is value or projection.alias == value.name
+        ):
+            names.add(value.name)
+    return names
