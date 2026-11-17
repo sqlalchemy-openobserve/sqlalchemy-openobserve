@@ -645,3 +645,32 @@ def test_timestamp_is_kept_when_the_select_list_is_unknown(
         ("_timestamp", "Int64"),
         ("level", "Utf8"),
     ]
+
+
+def test_star_keeps_the_timestamp_when_the_schema_is_a_field_short(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result(
+        ["_timestamp", "level", "status", "new_field"], [[1, "x", 200, "y"]]
+    )
+
+    cursor.execute("select * from app_logs")
+
+    assert [name for name, _ in names_and_types(cursor)] == [
+        "_timestamp",
+        "level",
+        "status",
+        "new_field",
+    ]
+    assert cursor.fetchall() == [(1, "x", 200, "y")]
+
+
+def test_a_query_of_only_expressions_makes_no_schema_request(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result(["count(*)"], [[3]])
+
+    cursor.execute("select count(*) from app_logs")
+
+    client.stream_schema.assert_not_called()
+    assert names_and_types(cursor) == [("count(*)", "Int64")]
