@@ -4,6 +4,7 @@ version = "0.0.1"
 description = "SQLAlchemy dialect and DBAPI driver for OpenObserve"
 authors = [
     {name = "Milen Thomas"},
+    {name = "Andy Yang"},
 ]
 readme = "README.md"
 license = "Apache-2.0"
@@ -21,6 +22,7 @@ classifiers = [
 dependencies = [
     "sqlalchemy>=2.0.52,<2.1",
     "requests>=2.31",
+    "sqlglot>=28.10,<29.0",
 ]
 
 [project.optional-dependencies]

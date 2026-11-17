@@ -72,6 +72,7 @@ def test_render_rejects_unsupported_type() -> None:
         "WITH recent AS (SELECT * FROM logs) SELECT * FROM recent",
         "SELECT 'DROP TABLE logs' FROM logs",
         'SELECT "delete" FROM logs',
+        "SELECT update, replace(message, 'a', 'b') FROM logs",
         "SHOW TABLES",
         "EXPLAIN SELECT * FROM logs;",
     ],
@@ -89,6 +90,9 @@ def test_read_only_queries(sql: str) -> None:
         "SELECT * FROM logs /* unterminated",
         "SELECT * FROM logs; /* hide */ UPDATE logs SET x=1",
         "WITH removed AS (DELETE FROM logs RETURNING *) SELECT * FROM removed",
+        "WITH recent AS (SELECT * FROM logs) "
+        "INSERT INTO archive SELECT * FROM recent",
+        "SELECT * FROM (DELETE FROM logs RETURNING *) AS removed",
         "",
     ],
 )
@@ -103,6 +107,20 @@ def test_write_and_injection_attempts_are_rejected(sql: str) -> None:
         ('SELECT * FROM "Case Sensitive"', "Case Sensitive"),
         ("SELECT * FROM schema.logs AS l", "schema.logs"),
         ("WITH x AS (SELECT * FROM hidden) SELECT * FROM visible", "visible"),
+        ("WITH x AS (SELECT * FROM logs) SELECT * FROM x", "logs"),
+        (
+            "WITH x AS (SELECT * FROM logs), y AS (SELECT * FROM x), "
+            "z AS (SELECT * FROM y) SELECT * FROM z",
+            "logs",
+        ),
+        ("SELECT * FROM logs JOIN users ON true", None),
+        (
+            "WITH x AS (SELECT * FROM logs JOIN users ON true) "
+            "SELECT * FROM x",
+            None,
+        ),
+        ("WITH x AS (SELECT * FROM missing) SELECT * FROM unknown", "unknown"),
+        ("WITH RECURSIVE x AS (SELECT * FROM x) SELECT * FROM x", None),
         ("SELECT * FROM (SELECT * FROM logs) x", None),
         ("SELECT 1", None),
     ],
@@ -119,6 +137,10 @@ def test_stream_ref(sql: str, expected: str | None) -> None:
         "SELECT logs._timestamp FROM logs",
         "SELECT * FROM logs",
         "SELECT logs.* FROM logs",
+        "SELECT DISTINCT _timestamp FROM logs",
+        "SELECT DISTINCT * FROM logs",
+        "SELECT ALL _timestamp FROM logs",
+        "SELECT _timestamp AS _timestamp FROM logs",
     ],
 )
 def test_selects_timestamp(sql: str) -> None:
@@ -132,6 +154,8 @@ def test_selects_timestamp(sql: str) -> None:
         "SELECT max(_timestamp) FROM logs",
         "SELECT '_timestamp' FROM logs",
         "SELECT message AS _timestamp FROM logs",
+        "SELECT _timestamp AS ts FROM logs",
+        "SELECT DISTINCT max(_timestamp) FROM logs",
     ],
 )
 def test_does_not_select_raw_timestamp(sql: str) -> None:
