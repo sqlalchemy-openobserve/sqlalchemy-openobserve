@@ -108,8 +108,7 @@ def is_read_only(sql: str) -> bool:
     statement = _parse_one(sql)
     if isinstance(statement, exp.Query):
         return not any(
-            isinstance(node, (exp.DDL, exp.DML))
-            for node in statement.walk()
+            isinstance(node, (exp.DDL, exp.DML)) for node in statement.walk()
         )
     if not isinstance(statement, exp.Command):
         return False
@@ -143,53 +142,59 @@ def _stream_names(
 ) -> set[str] | None:
     ctes = dict(inherited_ctes or {})
     if isinstance(query, exp.Query):
-        ctes.update({cte.alias.lower(): cte.this for cte in query.ctes})
-
-    sources: tuple[exp.Expression, ...]
-    if isinstance(query, exp.SetOperation):
-        sources = (query.this, query.expression)
-    elif isinstance(query, exp.Select):
-        from_ = query.args.get("from_")
-        sources = tuple(
-            source
-            for source in (
-                from_.this if isinstance(from_, exp.From) else None,
-                *(join.this for join in query.args.get("joins") or []),
-            )
-            if isinstance(source, exp.Expression)
+        ctes.update(
+            {
+                _identifier_name(cte.args["alias"].this): cte.this
+                for cte in query.ctes
+            }
         )
-    elif isinstance(query, exp.Subquery):
+
+    if isinstance(query, exp.Subquery):
         return _stream_names(query.this, ctes, resolving)
-    else:
+    if not isinstance(query, exp.Select):
         return None
+
+    from_ = query.args.get("from_")
+    sources = (
+        from_.this if isinstance(from_, exp.From) else None,
+        *(join.this for join in query.args.get("joins") or []),
+    )
 
     names: set[str] = set()
     for source in sources:
-        if isinstance(source, exp.Table):
-            name = _table_name(source)
-            cte_name = source.name.lower() if len(source.parts) == 1 else ""
-            if cte_name in ctes:
-                if cte_name in resolving:
-                    return None
-                resolved = _stream_names(
-                    ctes[cte_name], ctes, resolving | {cte_name}
-                )
-                if resolved is None:
-                    return None
-                names.update(resolved)
-            elif name:
-                names.add(name)
-            else:
+        if source is None:
+            continue
+        if not isinstance(source, exp.Table):
+            return None
+        table = source.this
+        cte_name = (
+            _identifier_name(table)
+            if len(source.parts) == 1 and isinstance(table, exp.Identifier)
+            else ""
+        )
+        if cte_name in ctes:
+            if cte_name in resolving:
                 return None
-        elif isinstance(source, exp.Subquery):
+            resolved = _stream_names(
+                ctes[cte_name], ctes, resolving | {cte_name}
+            )
+            if resolved is None:
+                return None
+            names.update(resolved)
+            continue
+        name = _table_name(source)
+        if not name:
             return None
-        else:
-            return None
+        names.add(name)
     return names
 
 
 def stream_ref(sql: str) -> str | None:
-    """Return the single real stream reachable from a query's sources."""
+    """Return the single real stream a query reads in its FROM and JOINs.
+
+    Subqueries in WHERE or the select list are not followed, and set
+    operations return None.
+    """
     statement = _parse_one(sql)
     if not isinstance(statement, exp.Query):
         return None
@@ -198,9 +203,12 @@ def stream_ref(sql: str) -> str | None:
 
 
 def selects_timestamp(sql: str) -> bool:
-    """Return whether the outer query outputs raw ``_timestamp`` or ``*``."""
+    """Return whether the outer query outputs raw ``_timestamp`` or ``*``.
+
+    A set operation is judged by its leftmost query, which names its columns.
+    """
     statement = _parse_one(sql)
-    if isinstance(statement, exp.SetOperation):
+    while isinstance(statement, (exp.SetOperation, exp.Subquery)):
         statement = statement.this
     if not isinstance(statement, exp.Select):
         return False

@@ -122,6 +122,16 @@ def test_write_and_injection_attempts_are_rejected(sql: str) -> None:
         ("WITH x AS (SELECT * FROM missing) SELECT * FROM unknown", "unknown"),
         ("WITH RECURSIVE x AS (SELECT * FROM x) SELECT * FROM x", None),
         ("SELECT * FROM (SELECT * FROM logs) x", None),
+        ('WITH "Logs" AS (SELECT * FROM secret) SELECT * FROM logs', "logs"),
+        (
+            'WITH "Logs" AS (SELECT * FROM secret) SELECT * FROM "Logs"',
+            "secret",
+        ),
+        ("WITH Logs AS (SELECT * FROM secret) SELECT * FROM logs", "secret"),
+        ("SELECT * FROM logs WHERE x IN (SELECT y FROM secret)", "logs"),
+        ("SELECT * FROM logs UNION SELECT * FROM logs", None),
+        ("(SELECT * FROM logs)", "logs"),
+        ("WITH x AS (SELECT 1) SELECT * FROM x JOIN logs ON true", "logs"),
         ("SELECT 1", None),
     ],
 )
@@ -141,6 +151,10 @@ def test_stream_ref(sql: str, expected: str | None) -> None:
         "SELECT DISTINCT * FROM logs",
         "SELECT ALL _timestamp FROM logs",
         "SELECT _timestamp AS _timestamp FROM logs",
+        "SELECT _timestamp FROM a UNION ALL SELECT _timestamp FROM b",
+        "SELECT * FROM a UNION SELECT * FROM b UNION SELECT * FROM c",
+        "(SELECT _timestamp FROM logs)",
+        "(SELECT _timestamp FROM a) UNION (SELECT _timestamp FROM b)",
     ],
 )
 def test_selects_timestamp(sql: str) -> None:
@@ -156,6 +170,8 @@ def test_selects_timestamp(sql: str) -> None:
         "SELECT message AS _timestamp FROM logs",
         "SELECT _timestamp AS ts FROM logs",
         "SELECT DISTINCT max(_timestamp) FROM logs",
+        "(SELECT message FROM logs)",
+        "SELECT message FROM a UNION SELECT _timestamp FROM b",
     ],
 )
 def test_does_not_select_raw_timestamp(sql: str) -> None:
