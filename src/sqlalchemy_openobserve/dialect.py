@@ -20,7 +20,7 @@ from sqlalchemy.engine.interfaces import (
 from sqlalchemy.engine.url import URL
 from sqlalchemy.sql import compiler
 
-from . import dbapi
+from . import dbapi, statements
 from .client import OpenObserveClient, OpenObserveError
 
 # OpenObserve has no schemas. Reflection reports this one, as
@@ -90,11 +90,27 @@ class OpenObserveIdentifierPreparer(compiler.IdentifierPreparer):
     schema_for_object = staticmethod(lambda obj: "")
 
 
+class OpenObserveCompiler(compiler.SQLCompiler):
+    def render_literal_value(
+        self, value: Any, type_: sqltypes.TypeEngine[Any]
+    ) -> str:
+        # Superset compiles with literal_binds, which bypasses the cursor
+        rendered = super().render_literal_value(value, type_)
+        # LIKE's ESCAPE character is the one literal that must stay a literal
+        if type_ is sqltypes.STRINGTYPE and rendered == "'\\'":
+            return rendered
+        try:
+            return statements.defuse_literal(rendered)
+        except ValueError as error:
+            raise exc.CompileError(str(error)) from error
+
+
 class OpenObserveDialect(default.DefaultDialect):
     name = "openobserve"
     driver = "rest"
     supports_statement_cache = False
     preparer = OpenObserveIdentifierPreparer
+    statement_compiler = OpenObserveCompiler
 
     @classmethod
     def import_dbapi(cls) -> ModuleType:

@@ -1,7 +1,8 @@
 """Prepare and inspect SQL statements sent to OpenObserve."""
 
 import math
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any
@@ -10,9 +11,39 @@ from uuid import UUID
 from sqlglot import exp, parse
 from sqlglot.errors import SqlglotError
 
+_STRING_LITERAL = re.compile(r"'((?:[^']|'')*)'", re.DOTALL)
 
-def _quote(value: str) -> str:
+
+def _plain_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def quote_string(
+    value: str, quote: Callable[[str], str] = _plain_quote
+) -> str:
+    """Quote a string value, with `quote` for each part between backslashes."""
+    # Observed: a value of `\' OR 1=1 --` matched every row on the server, so
+    # a backslash is never sent; chr(92) stands in for it. One concat() call,
+    # as a long `||` chain made the server take seconds at 2,000 backslashes.
+    if "\\" not in value:
+        return quote(value)
+    pieces: list[str] = []
+    for index, segment in enumerate(value.split("\\")):
+        if index:
+            pieces.append("chr(92)")
+        if segment:
+            pieces.append(quote(segment))
+    return pieces[0] if len(pieces) == 1 else f"concat({', '.join(pieces)})"
+
+
+def defuse_literal(rendered: str) -> str:
+    """Rewrite a rendered `'...'` string literal so it has no backslash."""
+    if "\\" not in rendered:
+        return rendered
+    match = _STRING_LITERAL.fullmatch(rendered)
+    if match is None:
+        raise ValueError(f"cannot send a backslash in {rendered!r} safely")
+    return quote_string(match.group(1), lambda part: f"'{part}'")
 
 
 def _literal(value: Any) -> str:
@@ -27,13 +58,13 @@ def _literal(value: Any) -> str:
             raise ValueError("non-finite numbers cannot be SQL literals")
         return str(value)
     if isinstance(value, str):
-        return _quote(value)
+        return quote_string(value)
     if isinstance(value, (bytes, bytearray, memoryview)):
         return "X'" + bytes(value).hex() + "'"
     if isinstance(value, (datetime, date, time)):
-        return _quote(value.isoformat())
+        return quote_string(value.isoformat())
     if isinstance(value, UUID):
-        return _quote(str(value))
+        return quote_string(str(value))
     raise TypeError(
         f"unsupported SQL bind parameter type: {type(value).__name__}"
     )
@@ -236,3 +267,78 @@ def selects_timestamp(sql: str) -> bool:
         ):
             return True
     return False
+
+
+def _outer_select(sql: str) -> exp.Select | None:
+    statement = _parse_one(sql)
+    while isinstance(statement, (exp.SetOperation, exp.Subquery)):
+        statement = statement.this
+    return statement if isinstance(statement, exp.Select) else None
+
+
+def _is_star(projection: exp.Expression) -> bool:
+    return isinstance(projection, exp.Star) or (
+        isinstance(projection, exp.Column)
+        and isinstance(projection.this, exp.Star)
+    )
+
+
+def output_columns(sql: str, stream_fields: list[str]) -> list[str] | None:
+    """Return the column names the outer SELECT outputs, or None if unknown.
+
+    The server names no columns for a result with no rows. ``*`` expands only
+    over a stream read directly, not a CTE, subquery or join. Unnamed
+    expressions are named by their SQL text, which the server may spell
+    differently (``max(logs.status)``).
+    """
+    statement = _outer_select(sql)
+    if statement is None:
+        return None
+
+    names: list[str] = []
+    for projection in statement.expressions:
+        if _is_star(projection):
+            source = statement.args.get("from_")
+            if (
+                statement.args.get("with_")
+                or statement.args.get("joins")
+                or source is None
+                or not isinstance(source.this, exp.Table)
+            ):
+                return None
+            names.extend(stream_fields)
+        elif isinstance(projection, exp.Alias):
+            alias = projection.args["alias"]
+            names.append(alias.name if alias.quoted else alias.name.lower())
+        elif isinstance(projection, exp.Column):
+            names.append(projection.name)
+        else:
+            names.append(projection.sql(normalize_functions="lower"))
+    return names
+
+
+def plain_columns(sql: str) -> set[str] | None:
+    """Return the fields the outer SELECT passes through unchanged.
+
+    None means ``*``. A column renamed or computed is left out, so its output
+    name is not mistaken for the stream field of that name, and so is
+    everything under a CTE, which can rename fields.
+    """
+    statement = _outer_select(sql)
+    if statement is None or statement.args.get("with_"):
+        return set()
+
+    names: set[str] = set()
+    for projection in statement.expressions:
+        if _is_star(projection):
+            return None
+        value = (
+            projection.this
+            if isinstance(projection, exp.Alias)
+            else projection
+        )
+        if isinstance(value, exp.Column) and (
+            projection is value or projection.alias == value.name
+        ):
+            names.add(value.name)
+    return names

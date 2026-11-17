@@ -7,7 +7,11 @@ from uuid import UUID
 import pytest
 
 from sqlalchemy_openobserve.statements import (
+    defuse_literal,
     is_read_only,
+    output_columns,
+    plain_columns,
+    quote_string,
     render,
     selects_timestamp,
     stream_ref,
@@ -22,6 +26,31 @@ def test_render_named_literals_and_escaping() -> None:
     assert sql == (
         "SELECT * FROM logs WHERE message='x'' OR 1=1 --' AND missing=NULL"
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "literal"),
+    [
+        ("a\\b", "concat('a', chr(92), 'b')"),
+        ("x\\", "concat('x', chr(92))"),
+        ("\\x", "concat(chr(92), 'x')"),
+        ("\\", "chr(92)"),
+        ("\\\\", "concat(chr(92), chr(92))"),
+        ("it's\\", "concat('it''s', chr(92))"),
+        ("\\' OR 1=1 --", "concat(chr(92), ''' OR 1=1 --')"),
+        ("a\\'b\\'c", "concat('a', chr(92), '''b', chr(92), '''c')"),
+    ],
+)
+def test_render_sends_no_backslash(value: str, literal: str) -> None:
+    sql = render("SELECT * FROM logs WHERE service = %(v)s", {"v": value})
+
+    assert sql == f"SELECT * FROM logs WHERE service = {literal}"
+    assert "\\" not in sql
+
+
+def test_render_a_value_without_a_backslash_is_a_plain_literal() -> None:
+    assert render("SELECT %s", ("it's",)) == "SELECT 'it''s'"
+    assert render("SELECT %s", ("",)) == "SELECT ''"
 
 
 def test_render_positional_and_doubled_percent() -> None:
@@ -212,3 +241,86 @@ def test_selects_timestamp(sql: str) -> None:
 )
 def test_does_not_select_raw_timestamp(sql: str) -> None:
     assert not selects_timestamp(sql)
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("SELECT level, status FROM logs", ["level", "status"]),
+        ("SELECT logs.level AS l, status s FROM logs", ["l", "s"]),
+        ("SELECT * FROM logs", ["a", "b"]),
+        ("SELECT logs.*, 1 AS one FROM logs", ["a", "b", "one"]),
+        ("SELECT count(*) FROM logs", ["count(*)"]),
+        ("SELECT COUNT(*), Max(a) FROM logs", ["count(*)", "max(a)"]),
+        ('SELECT a AS Lv, a AS "Lv" FROM logs', ["lv", "Lv"]),
+        ("WITH c AS (SELECT a FROM x) SELECT * FROM c", None),
+        ("SELECT * FROM (SELECT a FROM x) t", None),
+        ("SELECT * FROM x JOIN y ON x.a = y.a", None),
+        ("SELECT count(*) AS n FROM logs", ["n"]),
+        ("SELECT a FROM x UNION ALL SELECT b FROM y", ["a"]),
+        ("(SELECT a FROM x) UNION (SELECT b FROM y)", ["a"]),
+        ("WITH c AS (SELECT a FROM x) SELECT a FROM c", ["a"]),
+        ("SHOW STREAMS", None),
+        ("DELETE FROM logs", None),
+        ("not sql at all (", None),
+    ],
+)
+def test_output_columns(sql: str, expected: list[str] | None) -> None:
+    assert output_columns(sql, ["a", "b"]) == expected
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("SELECT level, logs.status FROM logs", {"level", "status"}),
+        ("SELECT level AS level, status AS code FROM logs", {"level"}),
+        ("SELECT status AS level, level AS status FROM logs", set()),
+        ("SELECT cast(status AS VARCHAR) AS status FROM logs", set()),
+        ("SELECT count(*), max(a) AS a FROM logs", set()),
+        ("SELECT * FROM logs", None),
+        ("SELECT a, * FROM logs", None),
+        ("SELECT a FROM x UNION ALL SELECT b FROM y", {"a"}),
+        ("SHOW STREAMS", set()),
+        ("WITH c AS (SELECT a FROM x) SELECT a FROM c", set()),
+        ("WITH c AS (SELECT a FROM x) SELECT * FROM c", set()),
+    ],
+)
+def test_plain_columns(sql: str, expected: set[str] | None) -> None:
+    assert plain_columns(sql) == expected
+
+
+def test_quote_string_applies_the_quoting_to_each_part() -> None:
+    assert (
+        quote_string("a\\b", lambda s: f"<{s}>") == "concat(<a>, chr(92), <b>)"
+    )
+    assert quote_string("ab", lambda s: f"<{s}>") == "<ab>"
+
+
+def test_many_backslashes_render_as_one_flat_call() -> None:
+    sql = quote_string("\\" * 500)
+
+    assert sql.startswith("concat(chr(92), chr(92)")
+    assert "||" not in sql
+    assert sql.count("chr(92)") == 500
+
+
+@pytest.mark.parametrize(
+    ("rendered", "expected"),
+    [
+        ("'plain'", "'plain'"),
+        ("'a\\b'", "concat('a', chr(92), 'b')"),
+        ("'it''s\\'", "concat('it''s', chr(92))"),
+        ("'\\'' OR 1=1 --'", "concat(chr(92), ''' OR 1=1 --')"),
+        ("'100%%\\x'", "concat('100%%', chr(92), 'x')"),
+    ],
+)
+def test_defuse_literal(rendered: str, expected: str) -> None:
+    assert defuse_literal(rendered) == expected
+
+
+@pytest.mark.parametrize("rendered", ["['a\\b']", "'a' || '\\'", "5\\"])
+def test_defuse_literal_rejects_what_it_cannot_rewrite(
+    rendered: str,
+) -> None:
+    with pytest.raises(ValueError, match="safely"):
+        defuse_literal(rendered)

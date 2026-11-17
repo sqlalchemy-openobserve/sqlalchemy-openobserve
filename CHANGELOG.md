@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Fix a SQL injection in string parameters: a value such as `\' OR 1=1 --`
+  matched every row on the server. Backslashes are now sent as `chr(92)`,
+  both for parameters the cursor binds and for literals SQLAlchemy inlines
+  with `literal_binds`, which Superset uses. `LIKE ... ESCAPE '\'` keeps its
+  backslash, and an inlined literal that cannot be rewritten (an ARRAY of
+  strings containing one) raises `CompileError` instead of compiling.
+- Known limit: the server reads a run of two or more consecutive apostrophes
+  in a string literal as fewer, so a value such as `it''s` matches `it's`.
+- Cursor results now describe their columns. `type_code` is the Arrow type
+  of a stream field passed through unchanged, and otherwise the type of the
+  first non-null value. A result with no rows still has a description, read
+  from the query's SELECT list; an unnamed expression is named by its SQL
+  text, which the server may spell differently, and a `*` over a CTE,
+  subquery or join gives none. The `_timestamp` column the server prepends to
+  a query that did not select it is dropped.
 - The dialect maps `openobserve://email:password@host:port/organization`
   (with `?ssl=false` and `?verify=`) onto `connect()`, pings with the
   client instead of `SELECT 1`, and reflects logs streams as tables in a

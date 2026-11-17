@@ -12,6 +12,7 @@ from sqlalchemy import (
     exc,
     func,
     inspect,
+    literal,
     select,
     table,
     types as sqltypes,
@@ -21,6 +22,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy_openobserve import dbapi
 from sqlalchemy_openobserve.client import OpenObserveClient, OpenObserveError
 from sqlalchemy_openobserve.dialect import OpenObserveDialect
+from sqlalchemy_openobserve.statements import is_read_only
 
 URL = "openobserve://root%40example.com:secret@observe.example/default"
 
@@ -361,3 +363,85 @@ def test_ping_and_reflection_against_real_server() -> None:
             wrong_password.dialect.do_ping(connection)
     finally:
         connection.close()
+
+
+def _literal_sql(expression: Any) -> str:
+    engine = create_engine(LOCAL_URL)
+    return str(
+        select(column("service"))
+        .where(expression)
+        .compile(engine, compile_kwargs={"literal_binds": True})
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "literal"),
+    [
+        ("\\' OR 1=1 --", "concat(chr(92), ''' OR 1=1 --')"),
+        ("a\\b", "concat('a', chr(92), 'b')"),
+        ("x\\", "concat('x', chr(92))"),
+        ("\\", "chr(92)"),
+    ],
+)
+def test_literal_binds_sends_no_backslash(value: str, literal: str) -> None:
+    sql = _literal_sql(column("service") == value)
+
+    assert sql.endswith(f"WHERE service = {literal}")
+    assert "\\" not in sql
+
+
+def test_literal_binds_keeps_the_default_quoting_otherwise() -> None:
+    assert _literal_sql(column("service") == "it's 100% odd").endswith(
+        "WHERE service = 'it''s 100%% odd'"
+    )
+    assert _literal_sql(column("service").like("%err%")).endswith(
+        "WHERE service LIKE '%%err%%'"
+    )
+    assert _literal_sql(column("service") == 5).endswith("WHERE service = 5")
+
+
+def test_literal_binds_in_list_and_contains_send_no_backslash() -> None:
+    in_sql = _literal_sql(column("service").in_(["a", "b\\c"]))
+    contains_sql = _literal_sql(column("service").contains("x\\y"))
+
+    assert "concat('b', chr(92), 'c')" in in_sql
+    assert "concat('x', chr(92), 'y')" in contains_sql
+    assert "\\" not in in_sql + contains_sql
+
+
+def test_like_escape_character_stays_a_literal() -> None:
+    sql = _literal_sql(column("service").like("a%", escape="\\"))
+
+    assert sql.endswith("WHERE service LIKE 'a%%' ESCAPE '\\'")
+    assert is_read_only(sql)
+
+
+def test_a_backslash_value_is_rewritten_for_any_literal_type() -> None:
+    injection = "\\' OR 1=1 --"
+    binary = _literal_sql(
+        column("service") == literal(injection.encode(), sqltypes.LargeBinary)
+    )
+
+    assert "\\" not in binary
+
+
+class _Prefixed(sqltypes.TypeDecorator[str]):
+    impl = sqltypes.String
+    cache_ok = True
+
+    def process_literal_param(self, value: Any, dialect: Any) -> str:
+        return f"p:{value}"
+
+
+def test_a_type_decorator_sees_the_whole_value() -> None:
+    sql = _literal_sql(column("service", _Prefixed()) == "a\\b")
+
+    assert sql.endswith("WHERE service = concat('p:a', chr(92), 'b')")
+
+
+def test_a_backslash_in_a_literal_that_cannot_be_rewritten_fails() -> None:
+    with pytest.raises(exc.CompileError, match="safely"):
+        _literal_sql(
+            column("service")
+            == literal(["a\\b"], sqltypes.ARRAY(sqltypes.String))
+        )

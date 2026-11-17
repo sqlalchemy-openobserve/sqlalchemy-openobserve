@@ -26,6 +26,11 @@ def client() -> Mock:
         "is_partial": False,
         "function_error": [],
     }
+    client.stream_schema.return_value = [
+        {"name": "_timestamp", "type": "Int64"},
+        {"name": "level", "type": "Utf8"},
+        {"name": "status", "type": "Int64"},
+    ]
     return client
 
 
@@ -91,6 +96,20 @@ def test_execute_searches_with_time_range_and_no_size_cap(
     client.search.assert_called_once_with(SQL, 10, 20, size=-999)
 
 
+def result(columns: list[str], rows: list[list[Any]]) -> dict[str, Any]:
+    return {
+        "columns": columns,
+        "rows": rows,
+        "is_partial": False,
+        "function_error": [],
+    }
+
+
+def names_and_types(cursor: dbapi.Cursor) -> list[tuple[Any, Any]]:
+    assert cursor.description is not None
+    return [(column[0], column[1]) for column in cursor.description]
+
+
 def test_execute_sets_description_and_rowcount(cursor: dbapi.Cursor) -> None:
     assert cursor.description is None
     assert cursor.rowcount == -1
@@ -98,26 +117,159 @@ def test_execute_sets_description_and_rowcount(cursor: dbapi.Cursor) -> None:
     cursor.execute(SQL)
 
     assert cursor.description == [
-        ("level", None, None, None, None, None, None),
-        ("count", None, None, None, None, None, None),
+        ("level", "Utf8", None, None, None, None, None),
+        ("count", "Int64", None, None, None, None, None),
     ]
     assert cursor.rowcount == 3
 
 
-def test_empty_result_has_empty_description(
+def test_type_code_is_the_stream_fields_type(
     cursor: dbapi.Cursor, client: Mock
 ) -> None:
-    client.search.return_value = {
-        "columns": [],
-        "rows": [],
-        "is_partial": False,
-        "function_error": [],
-    }
+    client.search.return_value = result(
+        ["_timestamp", "level", "status"], [[1, "info", 200]]
+    )
+
+    cursor.execute("select * from app_logs")
+
+    client.stream_schema.assert_called_once_with("app_logs")
+    assert names_and_types(cursor) == [
+        ("_timestamp", "Int64"),
+        ("level", "Utf8"),
+        ("status", "Int64"),
+    ]
+
+
+def test_type_code_of_an_expression_comes_from_its_first_value(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result(
+        ["a", "b", "c", "d", "e"],
+        [[None, None, None, None, None], [1, 1.5, "x", True, [1]]],
+    )
+
+    cursor.execute("select a, b, c, d, e from app_logs")
+
+    assert names_and_types(cursor) == [
+        ("a", "Int64"),
+        ("b", "Float64"),
+        ("c", "Utf8"),
+        ("d", "Boolean"),
+        ("e", None),
+    ]
+
+
+def test_type_code_is_none_when_every_value_is_null(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result(["a"], [[None], [None]])
+
+    cursor.execute("select a from app_logs")
+
+    assert names_and_types(cursor) == [("a", None)]
+
+
+def test_query_without_a_single_stream_skips_the_schema_request(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result(["level"], [["info"]])
+
+    cursor.execute("select level from a union all select level from b")
+
+    client.stream_schema.assert_not_called()
+    assert names_and_types(cursor) == [("level", "Utf8")]
+
+
+def test_schema_failure_leaves_types_to_the_values(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.stream_schema.side_effect = QueryError("no such stream")
 
     cursor.execute(SQL)
 
-    assert cursor.description == []
+    assert names_and_types(cursor) == [("level", "Utf8"), ("count", "Int64")]
+    assert cursor.rowcount == 3
+
+
+def test_prepended_timestamp_is_dropped(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result(
+        ["_timestamp", "level"], [[11, "info"], [12, "warn"]]
+    )
+
+    cursor.execute("select level from app_logs")
+
+    assert names_and_types(cursor) == [("level", "Utf8")]
+    assert cursor.fetchall() == [("info",), ("warn",)]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select _timestamp, level from app_logs",
+        "select * from app_logs",
+        "select distinct _timestamp, level from app_logs",
+    ],
+)
+def test_selected_timestamp_is_kept(
+    cursor: dbapi.Cursor, client: Mock, sql: str
+) -> None:
+    client.search.return_value = result(["_timestamp", "level"], [[11, "x"]])
+
+    cursor.execute(sql)
+
+    assert names_and_types(cursor) == [
+        ("_timestamp", "Int64"),
+        ("level", "Utf8"),
+    ]
+    assert cursor.fetchall() == [(11, "x")]
+
+
+def test_empty_result_describes_the_selected_columns(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result([], [])
+
+    cursor.execute("select level, app_logs.status as code from app_logs")
+
+    assert names_and_types(cursor) == [("level", "Utf8"), ("code", None)]
     assert cursor.rowcount == 0
+    assert cursor.fetchall() == []
+
+
+def test_empty_result_expands_star_to_the_stream_fields(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result([], [])
+
+    cursor.execute("select * from app_logs where false")
+
+    assert names_and_types(cursor) == [
+        ("_timestamp", "Int64"),
+        ("level", "Utf8"),
+        ("status", "Int64"),
+    ]
+
+
+def test_empty_result_names_an_unnamed_expression_by_its_sql(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result([], [])
+
+    cursor.execute("select level, count(*) from app_logs group by level")
+
+    assert names_and_types(cursor) == [("level", "Utf8"), ("count(*)", None)]
+
+
+def test_empty_result_of_an_unparseable_query_has_no_description(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result([], [])
+
+    cursor.execute("show streams")
+
+    assert cursor.description == []
     assert cursor.fetchall() == []
 
 
@@ -365,3 +517,131 @@ def test_type_objects_do_not_match_other_type_codes() -> None:
     assert dbapi.NUMBER != "Utf8"
     assert dbapi.STRING != None  # noqa: E711
     assert dbapi.ROWID != "Utf8"
+
+
+def test_a_selected_timestamp_alias_is_kept(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result(["_timestamp"], [[3000]])
+
+    cursor.execute("select count(*) as _timestamp from app_logs")
+
+    assert names_and_types(cursor) == [("_timestamp", "Int64")]
+    assert cursor.fetchall() == [(3000,)]
+
+
+def test_a_prepended_timestamp_before_a_timestamp_alias_is_dropped(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result(
+        ["_timestamp", "_timestamp"], [[11, "info"]]
+    )
+
+    cursor.execute("select level as _timestamp from app_logs")
+
+    assert cursor.fetchall() == [("info",)]
+    assert cursor.description is not None
+    assert len(cursor.description) == 1
+
+
+def test_aliased_timestamp_aggregate_next_to_a_column_is_kept(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result(
+        ["_timestamp", "level"], [[11, "info"]]
+    )
+
+    cursor.execute(
+        "select max(_timestamp) as _timestamp, level from app_logs "
+        "group by level"
+    )
+
+    assert names_and_types(cursor) == [
+        ("_timestamp", "Int64"),
+        ("level", "Utf8"),
+    ]
+    assert cursor.fetchall() == [(11, "info")]
+
+
+def test_star_over_a_cte_keeps_the_servers_columns(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result(["level", "status"], [["info", 200]])
+
+    cursor.execute(
+        "with c as (select level, status from app_logs) select * from c"
+    )
+
+    assert names_and_types(cursor) == [("level", "Utf8"), ("status", "Int64")]
+    assert cursor.fetchall() == [("info", 200)]
+
+
+def test_empty_star_over_a_cte_is_not_expanded_to_the_stream(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result([], [])
+
+    cursor.execute(
+        "with c as (select level from app_logs) select * from c where false"
+    )
+
+    assert cursor.description == []
+
+
+def test_an_alias_does_not_take_the_type_of_a_field_with_its_name(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result(["status", "level"], [["500", 200]])
+
+    cursor.execute(
+        "select cast(status as varchar) as status, status as level "
+        "from app_logs"
+    )
+
+    assert names_and_types(cursor) == [("status", "Utf8"), ("level", "Int64")]
+
+
+def test_schema_type_wins_over_the_value_type(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result(["status"], [[200.0]])
+
+    cursor.execute("select status from app_logs")
+
+    assert names_and_types(cursor) == [("status", "Int64")]
+
+
+def test_a_quoted_alias_keeps_its_case(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result(["Lvl"], [])
+
+    cursor.execute('select level as "Lvl" from app_logs')
+
+    assert names_and_types(cursor) == [("Lvl", None)]
+
+
+def test_a_column_renamed_in_a_cte_does_not_take_the_streams_type(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result(["status"], [["500"]])
+
+    cursor.execute(
+        "with c as (select cast(status as varchar) as status from app_logs) "
+        "select status from c"
+    )
+
+    assert names_and_types(cursor) == [("status", "Utf8")]
+
+
+def test_timestamp_is_kept_when_the_select_list_is_unknown(
+    cursor: dbapi.Cursor, client: Mock
+) -> None:
+    client.search.return_value = result(["_timestamp", "level"], [[1, "x"]])
+
+    cursor.execute("with c as (select * from app_logs) select * from c")
+
+    assert names_and_types(cursor) == [
+        ("_timestamp", "Int64"),
+        ("level", "Utf8"),
+    ]
