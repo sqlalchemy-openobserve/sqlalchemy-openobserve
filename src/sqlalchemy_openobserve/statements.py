@@ -1,7 +1,8 @@
 """Prepare and inspect SQL statements sent to OpenObserve."""
 
 import math
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any
@@ -10,9 +11,39 @@ from uuid import UUID
 from sqlglot import exp, parse
 from sqlglot.errors import SqlglotError
 
+_STRING_LITERAL = re.compile(r"'((?:[^']|'')*)'", re.DOTALL)
 
-def _quote(value: str) -> str:
+
+def _plain_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def quote_string(
+    value: str, quote: Callable[[str], str] = _plain_quote
+) -> str:
+    """Quote a string value, with `quote` for each part between backslashes."""
+    # Observed: a value of `\' OR 1=1 --` matched every row on the server, so
+    # a backslash is never sent; chr(92) stands in for it. One concat() call,
+    # as a long `||` chain made the server take seconds at 2,000 backslashes.
+    if "\\" not in value:
+        return quote(value)
+    pieces: list[str] = []
+    for index, segment in enumerate(value.split("\\")):
+        if index:
+            pieces.append("chr(92)")
+        if segment:
+            pieces.append(quote(segment))
+    return pieces[0] if len(pieces) == 1 else f"concat({', '.join(pieces)})"
+
+
+def defuse_literal(rendered: str) -> str:
+    """Rewrite a rendered `'...'` string literal so it has no backslash."""
+    if "\\" not in rendered:
+        return rendered
+    match = _STRING_LITERAL.fullmatch(rendered)
+    if match is None:
+        raise ValueError(f"cannot send a backslash in {rendered!r} safely")
+    return quote_string(match.group(1), lambda part: f"'{part}'")
 
 
 def _literal(value: Any) -> str:
@@ -27,13 +58,13 @@ def _literal(value: Any) -> str:
             raise ValueError("non-finite numbers cannot be SQL literals")
         return str(value)
     if isinstance(value, str):
-        return _quote(value)
+        return quote_string(value)
     if isinstance(value, (bytes, bytearray, memoryview)):
         return "X'" + bytes(value).hex() + "'"
     if isinstance(value, (datetime, date, time)):
-        return _quote(value.isoformat())
+        return quote_string(value.isoformat())
     if isinstance(value, UUID):
-        return _quote(str(value))
+        return quote_string(str(value))
     raise TypeError(
         f"unsupported SQL bind parameter type: {type(value).__name__}"
     )

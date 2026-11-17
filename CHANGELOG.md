@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Fix a SQL injection in string parameters: a value such as `\' OR 1=1 --`
+  matched every row on the server. Backslashes are now sent as `chr(92)`,
+  both for parameters the cursor binds and for literals SQLAlchemy inlines
+  with `literal_binds`, which Superset uses. `LIKE ... ESCAPE '\'` keeps its
+  backslash, and an inlined literal that cannot be rewritten (an ARRAY of
+  strings containing one) raises `CompileError` instead of compiling.
+- Known limit: the server reads a run of two or more consecutive apostrophes
+  in a string literal as fewer, so a value such as `it''s` matches `it's`.
 - Cursor results now describe their columns. `type_code` is the Arrow type
   of a stream field passed through unchanged, and otherwise the type of the
   first non-null value. A result with no rows still has a description, read

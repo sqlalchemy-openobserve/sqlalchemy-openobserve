@@ -7,9 +7,11 @@ from uuid import UUID
 import pytest
 
 from sqlalchemy_openobserve.statements import (
+    defuse_literal,
     is_read_only,
     output_columns,
     plain_columns,
+    quote_string,
     render,
     selects_timestamp,
     stream_ref,
@@ -24,6 +26,31 @@ def test_render_named_literals_and_escaping() -> None:
     assert sql == (
         "SELECT * FROM logs WHERE message='x'' OR 1=1 --' AND missing=NULL"
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "literal"),
+    [
+        ("a\\b", "concat('a', chr(92), 'b')"),
+        ("x\\", "concat('x', chr(92))"),
+        ("\\x", "concat(chr(92), 'x')"),
+        ("\\", "chr(92)"),
+        ("\\\\", "concat(chr(92), chr(92))"),
+        ("it's\\", "concat('it''s', chr(92))"),
+        ("\\' OR 1=1 --", "concat(chr(92), ''' OR 1=1 --')"),
+        ("a\\'b\\'c", "concat('a', chr(92), '''b', chr(92), '''c')"),
+    ],
+)
+def test_render_sends_no_backslash(value: str, literal: str) -> None:
+    sql = render("SELECT * FROM logs WHERE service = %(v)s", {"v": value})
+
+    assert sql == f"SELECT * FROM logs WHERE service = {literal}"
+    assert "\\" not in sql
+
+
+def test_render_a_value_without_a_backslash_is_a_plain_literal() -> None:
+    assert render("SELECT %s", ("it's",)) == "SELECT 'it''s'"
+    assert render("SELECT %s", ("",)) == "SELECT ''"
 
 
 def test_render_positional_and_doubled_percent() -> None:
@@ -260,3 +287,40 @@ def test_output_columns(sql: str, expected: list[str] | None) -> None:
 )
 def test_plain_columns(sql: str, expected: set[str] | None) -> None:
     assert plain_columns(sql) == expected
+
+
+def test_quote_string_applies_the_quoting_to_each_part() -> None:
+    assert (
+        quote_string("a\\b", lambda s: f"<{s}>") == "concat(<a>, chr(92), <b>)"
+    )
+    assert quote_string("ab", lambda s: f"<{s}>") == "<ab>"
+
+
+def test_many_backslashes_render_as_one_flat_call() -> None:
+    sql = quote_string("\\" * 500)
+
+    assert sql.startswith("concat(chr(92), chr(92)")
+    assert "||" not in sql
+    assert sql.count("chr(92)") == 500
+
+
+@pytest.mark.parametrize(
+    ("rendered", "expected"),
+    [
+        ("'plain'", "'plain'"),
+        ("'a\\b'", "concat('a', chr(92), 'b')"),
+        ("'it''s\\'", "concat('it''s', chr(92))"),
+        ("'\\'' OR 1=1 --'", "concat(chr(92), ''' OR 1=1 --')"),
+        ("'100%%\\x'", "concat('100%%', chr(92), 'x')"),
+    ],
+)
+def test_defuse_literal(rendered: str, expected: str) -> None:
+    assert defuse_literal(rendered) == expected
+
+
+@pytest.mark.parametrize("rendered", ["['a\\b']", "'a' || '\\'", "5\\"])
+def test_defuse_literal_rejects_what_it_cannot_rewrite(
+    rendered: str,
+) -> None:
+    with pytest.raises(ValueError, match="safely"):
+        defuse_literal(rendered)
