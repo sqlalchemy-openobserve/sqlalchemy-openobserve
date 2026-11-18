@@ -13,8 +13,16 @@ SQLAlchemy so tools built on SQLAlchemy can read from it. It is read-only.
 The client checks connectivity by listing streams; a `SELECT 1` probe is not
 valid because OpenObserve queries must reference a stream.
 
-The Superset side (the DB engine spec) will live in the Apache Superset
-repository, not here.
+- Each logs stream is a table in a single schema called `default`, which
+  compiled SQL leaves out.
+- The time range of a search comes from `_timestamp` comparisons in the SQL.
+  Any side they do not bound is left open, from just after the epoch to 25
+  hours ahead of now. The driver adds no row cap of its own, so the SQL's
+  `LIMIT` decides how many rows come back (but see the known limit on
+  `ORDER BY ... LIMIT` in the
+  [CHANGELOG](https://github.com/sqlalchemy-openobserve/sqlalchemy-openobserve/blob/main/CHANGELOG.md)).
+- The server adds `_timestamp` to non-aggregate queries that did not select
+  it, and the driver drops it again.
 
 ## Install
 
@@ -33,14 +41,14 @@ openobserve://{email}:{password}@{host}:{port}/{organization}
   password the same way.
 - HTTPS is used by default. Add `?ssl=false` for a plain HTTP server such as
   a local one on port 5080.
+- The port defaults to 5080, so give it explicitly for an HTTPS server on 443.
 - `?verify=false` turns off TLS certificate checks, and
   `?verify=/path/to/ca.pem` checks against your own CA bundle.
 - `openobserve+rest://` is the same thing with the driver named explicitly.
 
 ## Example
 
-Each logs stream is a table. Its `_timestamp` column holds the event time as
-microseconds since the Unix epoch.
+`_timestamp` holds the event time as microseconds since the Unix epoch.
 
 ```python
 from sqlalchemy import create_engine, text
@@ -64,8 +72,10 @@ Python 3.11 or newer, SQLAlchemy 2.0.52 or newer in the 2.0 series.
 ## Superset compatibility
 
 This package targets Apache Superset 7. Superset also needs a DB engine spec
-for OpenObserve, which is not in a Superset release yet. The two have been
-tested together on Superset's `master` branch.
+for OpenObserve, which will live in the Apache Superset repository, not here,
+and is not in Superset yet. The two have been tested together on Superset's
+`master` branch plus that engine spec, from the `openobserve-engine-spec`
+branch of the `sqlalchemy-openobserve/superset` fork.
 Superset 6.x and earlier are not supported: they pin SQLAlchemy below 2.0, and
 this package needs SQLAlchemy 2.0.52 or newer, so pip cannot install the two
 together.
