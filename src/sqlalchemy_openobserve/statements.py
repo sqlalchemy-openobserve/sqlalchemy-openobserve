@@ -131,7 +131,8 @@ def _parse_one(sql: str) -> exp.Expression | None:
         return None
     if len(statements) != 1:
         return None
-    return statements[0]
+    statement = statements[0]
+    return statement if isinstance(statement, exp.Expression) else None
 
 
 def is_read_only(sql: str) -> bool:

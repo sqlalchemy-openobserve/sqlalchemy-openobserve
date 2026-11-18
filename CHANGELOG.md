@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.1.1
+
+- Allow `sqlglot` 29 and 30. 0.1.0 required `sqlglot<29`, but Apache Superset 7
+  requires `sqlglot` 30, so the two could not be installed together.
+
 ## 0.1.0
 
 The first release that works. SQLAlchemy can connect to OpenObserve, list its
